@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+output/
+*.mp4
+*.wav
+*.mkv
+*.webm
+*.mov
