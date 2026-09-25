@@ -1,65 +1,66 @@
-# Dance Dub — download Wix videos, transcribe, translate, and add subtitles
+# Dance Dub — download Wix videos, transcribe, translate, add subtitles
 
-Dance Dub is a free, local tool for Windows that takes videos from a Wix website and produces a copy with burned-in translated subtitles. Every step can run on its own or as one pipeline.
+Dance Dub takes a video from a Wix site (or any video file on your computer), transcribes the speech, translates it, and produces a copy with burned-in subtitles. Everything runs locally — no accounts, no API keys, no uploads.
+
+## Windows app (recommended)
+
+1. Download `DanceDub-windows.zip` from the repo's [Releases](../../releases) page
+2. Unzip it anywhere (keep all files together)
+3. Double-click **`DanceDub.exe`** — your browser opens the app
+   - First launch: Windows SmartScreen may warn ("Windows protected your PC"). Click **More info → Run anyway** — the app is unsigned but only talks to `127.0.0.1` on your own machine
+4. Paste a Wix video page URL **or** switch to "From a file on this PC" and drop a video in
+5. Pick the language and accuracy, press **Start**
+
+First transcription downloads the AI model once (~460 MB), then it's cached in your user folder. Output lands in `<user folder>\DanceDub\Videos\<video name>\`.
+
+## macOS / Linux (from source)
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+PYTHONPATH=src .venv/bin/python -m dance_dub        # app (opens browser)
+PYTHONPATH=src .venv/bin/python -m dance_dub.cli --help   # CLI
+```
 
 ## What it does
 
-1. **Download** a video from a Wix site page URL (or a direct video URL, or YouTube/Vimeo links)
-2. **Extract audio** from the video
-3. **Transcribe** the speech (Whisper, runs locally on your CPU — no accounts, no API keys)
-4. **Translate** the transcript (Google Translate, keyless)
-5. **Burn captions** into a copy of the video
+1. **Download** — Wix pages, direct `wixstatic.com` URLs, YouTube/Vimeo embeds
+2. **Extract audio** — 16 kHz mono WAV
+3. **Transcribe** — Whisper (faster-whisper, CPU) with language auto-detect
+4. **Translate** — Google (keyless) with MyMemory fallback
+5. **Burn** — styled subtitles rendered into a copy of the video
 
-## Install (one time)
+Each stage is also a CLI subcommand; finished stages are skipped on re-run, so a crashed job resumes where it left off.
 
-1. Install Python from https://www.python.org/downloads/ — **check "Add python.exe to PATH"** on the first screen
-2. Double-click `install.bat`
-3. Wait for it to finish (it downloads ~500 MB of AI model on first run of transcribe, that's normal)
-
-That's it. To use it, double-click **`run_gui.bat`**.
-
-## GUI usage
-
-1. Paste the video page URL (e.g. `https://your-site.wixsite.com/mysite/some-page`)
-2. Pick an output folder
-3. Choose "Translate to" language (default: English)
-4. Click **Run all steps**
-5. Find the result in `<output folder>/<video name>/final_<video name>.mp4`
-
-Buttons for each single step are there too, if you only want part of the process.
-
-## CLI usage
+## CLI
 
 ```
-run_cli.bat all --url https://your-site.wixsite.com/mysite/some-page -o output --target-lang en
-run_cli.bat download --url <url> -o output
-run_cli.bat transcribe --input output/<video> --model small
-run_cli.bat translate --input output/<video> --target-lang en
-run_cli.bat burn --input output/<video>
+run_cli.bat all --url https://your-site.wixsite.com/mysite/page -o output --target-lang en
+run_cli.bat download|extract-audio|transcribe|translate|burn --input output/<video>
 ```
-
-Available subcommands: `download`, `extract-audio`, `transcribe`, `read-transcript`, `translate`, `burn`, `all`.
-
-Run `run_cli.bat --help` for every option.
 
 ## Files produced per video
 
 | File | What it is |
 |---|---|
-| `video.mp4` | downloaded original |
-| `audio.wav` | extracted 16 kHz mono audio |
+| `video.mp4` | the original video |
+| `audio.wav` | extracted audio |
 | `transcript.srt` / `transcript.txt` | original-language transcript |
 | `transcript_translated.srt` | translated subtitles |
 | `final_<video name>.mp4` | video with subtitles burned in |
 
 ## Troubleshooting
 
-- **"ffmpeg not found"** — run `install.bat` again; it installs a bundled copy automatically.
-- **Download fails on a Wix page** — try the direct video URL: open the page in Chrome → F12 → Network tab → play the video → find the `video.wixstatic.com/...file.mp4` request → copy its URL. Paste that as the URL.
-- **First transcription is slow / downloads a model** — normal; it caches locally (`~/.cache`).
-- **Translation fails repeatedly** — Google's free endpoint occasionally rate-limits; wait a minute and re-run `translate` (earlier steps are kept).
-- **Transcription quality** — try `--model medium` (slower, better) or `--model tiny` (faster draft).
+- **SmartScreen warning** — More info → Run anyway (one time). Signing certs cost money; this is a personal tool.
+- **Download fails on a Wix page** — try the direct video URL: open the page in Chrome → F12 → Network tab → play the video → find the `video.wixstatic.com/...file.mp4` request → copy that URL.
+- **First transcription is slow** — normal; it downloads the model once. `tiny`/`base` models are faster drafts.
+- **Music-only video** — there's no speech to caption; the app will tell you.
+- **Translation fails repeatedly** — the free Google endpoint rate-limits sometimes; wait a minute and press Start again (finished stages are kept).
+
+## Building the Windows app
+
+Tag a release (`v*`) or run the workflow manually — `.github/workflows/build-windows.yml` builds with PyInstaller on a Windows runner, smoke-tests that the exe actually serves the UI, and attaches `DanceDub-windows.zip` to the release.
 
 ## Costs & privacy
 
-Everything runs on your own machine. No accounts, no API keys, no uploads. Free forever.
+Free. Everything runs on your own machine; nothing leaves it except the video download and translation lookups.

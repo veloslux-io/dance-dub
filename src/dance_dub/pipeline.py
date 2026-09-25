@@ -583,6 +583,11 @@ def burn_subtitles(
         raise FileNotFoundError(
             "No transcript SRT in folder — run transcribe (and translate) first."
         )
+    if not srt.read_text(encoding="utf-8").strip():
+        raise RuntimeError(
+            "No speech was detected in this video, so there are no subtitles "
+            "to burn. (Music-only or silent videos can't be captioned.)"
+        )
     out = workdir / f"final_{workdir.name}.mp4"
     if out.exists() and not force:
         log(f"[burn] {out.name} exists, skipping")
@@ -598,6 +603,58 @@ def burn_subtitles(
 # Orchestrator
 # --------------------------------------------------------------------------
 
+def start_from_file(
+    video_path: Path,
+    out_root: Path,
+    target_lang: str = "en",
+    source_lang: str = "auto",
+    model_size: str = "small",
+    style: str = DEFAULT_STYLE,
+    log: LogFn = default_log,
+) -> Path:
+    """Run stages 2-5 on a video already on disk. Returns the final video path."""
+    video_path = Path(video_path).expanduser().resolve()
+    if not video_path.exists():
+        raise FileNotFoundError(f"File not found: {video_path}")
+    if video_path.suffix.lower() not in VIDEO_EXTS:
+        raise ValueError(
+            f"Unsupported file type '{video_path.suffix}'. "
+            f"Supported: {', '.join(sorted(VIDEO_EXTS))}"
+        )
+    workdir = out_root / slugify(video_path.stem or "local-video")
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / f"video{video_path.suffix.lower()}"
+    if video_path != dest:
+        if dest.exists():
+            dest.unlink()
+        import shutil
+
+        shutil.copy2(video_path, dest)
+        log(f"[download] copied {video_path.name} into {workdir.name}")
+    return run_pipeline(workdir, target_lang=target_lang, source_lang=source_lang,
+                        model_size=model_size, style=style, log=log)
+
+
+def run_pipeline(
+    workdir: Path,
+    target_lang: str = "en",
+    source_lang: str = "auto",
+    model_size: str = "small",
+    style: str = DEFAULT_STYLE,
+    log: LogFn = default_log,
+) -> Path:
+    """Run stages 2-5 inside an existing workdir (assumes video present)."""
+    extract_audio(workdir, log=log)
+    transcribe_audio(workdir, model_size=model_size, log=log)
+    translate_srt_file(
+        workdir / "transcript.srt",
+        target_lang=target_lang,
+        source_lang=source_lang,
+        log=log,
+    )
+    return burn_subtitles(workdir, style=style, log=log)
+
+
 def run_all(
     url: str,
     out_root: Path,
@@ -611,12 +668,5 @@ def run_all(
     workdir = out_root / slugify(url)
     workdir.mkdir(parents=True, exist_ok=True)
     download_video(url, workdir, log=log)
-    extract_audio(workdir, log=log)
-    transcribe_audio(workdir, model_size=model_size, log=log)
-    translate_srt_file(
-        workdir / "transcript.srt",
-        target_lang=target_lang,
-        source_lang=source_lang,
-        log=log,
-    )
-    return burn_subtitles(workdir, style=style, log=log)
+    return run_pipeline(workdir, target_lang=target_lang, source_lang=source_lang,
+                        model_size=model_size, style=style, log=log)
