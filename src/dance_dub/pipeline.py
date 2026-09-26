@@ -277,6 +277,12 @@ def download_video(
         "quiet": True,
         "no_warnings": True,
     }
+    # Merging separate video+audio streams needs ffmpeg; point yt-dlp at the
+    # bundled one so it works on machines without ffmpeg on PATH.
+    try:
+        options["ffmpeg_location"] = ffmpeg_exe()
+    except RuntimeError:
+        pass
     log(f"[download] fetching {url}")
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -302,7 +308,10 @@ def download_video(
 
 def _run_ffmpeg(cmd: List[str], log: LogFn) -> None:
     """Run ffmpeg, surfacing its stderr on failure instead of a bare traceback."""
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # CREATE_NO_WINDOW: the packaged exe has no console, so without it every
+    # ffmpeg call would flash a black console window on Windows.
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.splitlines()[-12:])
         raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}):\n{tail}")

@@ -9,8 +9,8 @@ on:
 # To use GitHub's cloud runner instead, change the line below to:
 #   runs-on: windows-latest
 # (note: private repos burn Actions minutes 2x on Windows cloud runners)
-# The self-hosted runner needs Git Bash on its PATH (for the test step);
-# the other script steps use the built-in Windows PowerShell.
+# All script steps use the built-in Windows PowerShell, so the runner needs
+# nothing installed beyond what setup-python provides.
 jobs:
   build:
     runs-on: [self-hosted, Windows]
@@ -24,13 +24,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          python -m pip install -r requirements.txt pyinstaller pytest
 
       - name: Run tests
-        shell: bash
+        shell: powershell
         env:
           PYTHONPATH: src
-        run: pytest tests/ -q
+        run: python -m pytest tests/ -q
 
       - name: Build with PyInstaller
         run: pyinstaller dance-dub.spec --noconfirm --clean
@@ -49,7 +49,7 @@ jobs:
           }
           Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           if (-not $ok) { throw "Smoke test failed: server never responded" }
-          Write-Host "Smoke test OK — DanceDub.exe serving on 127.0.0.1:8756"
+          Write-Host "Smoke test OK - DanceDub.exe serving on 127.0.0.1:8756"
 
       - name: Package zip
         shell: powershell
@@ -59,7 +59,7 @@ jobs:
           Dance Dub
           =========
 
-          1. Unzip this folder anywhere (e.g. C:\Tools\DanceDub) — keep all files together.
+          1. Unzip this folder anywhere (e.g. C:\Tools\DanceDub) and keep all files together.
           2. Double-click DanceDub.exe. Your browser opens the app.
              (If Windows SmartScreen appears: More info -> Run anyway. The app is
               unsigned; it only talks to 127.0.0.1 on your own machine.)
@@ -67,7 +67,7 @@ jobs:
              and drop a video in. Pick a language, press Start.
 
           First transcription downloads the AI model once (~460 MB), then it's cached.
-          Everything runs locally — nothing is uploaded anywhere.
+          Everything runs locally: nothing is uploaded anywhere.
 
           Output lands in: <your user folder>\DanceDub\Videos\<video name>\
           "@ | Out-File -FilePath dist\DanceDub\READ-ME-FIRST.txt -Encoding utf8
