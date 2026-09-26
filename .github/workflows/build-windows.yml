@@ -51,6 +51,47 @@ jobs:
           if (-not $ok) { throw "Smoke test failed: server never responded" }
           Write-Host "Smoke test OK - DanceDub.exe serving on 127.0.0.1:8756"
 
+      - name: End-to-end test (transcribe, translate, burn a spoken clip)
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          # Runs the whole pipeline inside the packaged exe, the way a user would,
+          # so missing bundled data (models, DLLs) fails the build, not the user.
+          $tmp = Join-Path $env:RUNNER_TEMP "e2e"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          Add-Type -AssemblyName System.Speech
+          $tts = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $tts.SetOutputToWaveFile("$tmp\speech.wav")
+          $tts.Speak("Step forward with your left foot. Now turn around and clap your hands twice.")
+          $tts.Dispose()
+          $ffmpeg = (Get-ChildItem "dist\DanceDub\_internal\imageio_ffmpeg\binaries\ffmpeg*.exe" | Select-Object -First 1).FullName
+          & $ffmpeg -y -loglevel error -f lavfi -i color=c=black:s=320x240:r=25 -i "$tmp\speech.wav" -shortest -c:v libx264 -pix_fmt yuv420p -c:a aac "$tmp\e2e-test.mp4"
+          if ($LASTEXITCODE -ne 0) { throw "could not create test video" }
+
+          $proc = Start-Process -FilePath "dist\DanceDub\DanceDub.exe" -PassThru
+          try {
+            foreach ($i in 1..30) {
+              Start-Sleep -Seconds 1
+              try { Invoke-WebRequest -Uri "http://127.0.0.1:8756/api/defaults" -UseBasicParsing -TimeoutSec 3 | Out-Null; break } catch {}
+            }
+            $body = @{ mode = "file"; path = "$tmp\e2e-test.mp4"; output = "$tmp\out"; model = "tiny"; target_lang = "es" } | ConvertTo-Json
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8756/api/start" -ContentType "application/json" -Body $body | Out-Null
+            $snap = $null
+            foreach ($i in 1..360) {
+              Start-Sleep -Seconds 3
+              $snap = Invoke-RestMethod -Uri "http://127.0.0.1:8756/api/status"
+              if (-not $snap.status.running -and ($snap.status.done -or $snap.status.error)) { break }
+            }
+            $snap.log | ForEach-Object { Write-Host $_ }
+            if (-not $snap.status.done) { throw "End-to-end run failed: $($snap.status.error)" }
+            $srt = Get-ChildItem "$tmp\out" -Recurse -Filter "transcript.srt" | Select-Object -First 1
+            if (-not $srt -or (Get-Content $srt.FullName -Raw).Trim().Length -eq 0) { throw "No transcript was produced" }
+            Write-Host "--- transcript.srt ---"
+            Get-Content $srt.FullName | Write-Host
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Package zip
         shell: powershell
         run: |
