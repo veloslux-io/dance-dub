@@ -91,6 +91,29 @@ def test_burn_cmd_regular_path():
     assert vf.startswith("subtitles='")
 
 
+# --- subtitle sizing -------------------------------------------------------------
+
+def test_srt_to_ass_sizes_text_to_the_video():
+    srt = "1\n00:00:01,500 --> 00:00:03,250\nHello {there}\n"
+    ass = P.srt_to_ass(srt, 536, 954)  # portrait phone video
+    assert "PlayResX: 536" in ass and "PlayResY: 954" in ass
+    style = next(ln for ln in ass.splitlines() if ln.startswith("Style: "))
+    assert style.split(",")[2] == "29"  # 5.5% of the short side, not 79px
+    assert "Dialogue: 0,0:00:01.50,0:00:03.25,Default,,0,0,0,,Hello (there)" in ass
+
+
+def test_probe_video_size_applies_rotation(monkeypatch):
+    stderr = (
+        "Stream #0:0: Video: h264 (High), yuv420p(tv), 1920x1080, 30 fps\n"
+        "    Side data:\n      displaymatrix: rotation of -90.00 degrees\n"
+    )
+    monkeypatch.setattr(
+        P.subprocess, "run",
+        lambda *a, **k: type("R", (), {"stderr": stderr, "returncode": 1})(),
+    )
+    assert P.probe_video_size("ffmpeg", Path("v.mov")) == (1080, 1920)
+
+
 # --- stage skip/force behaviour ------------------------------------------------
 
 def test_extract_audio_requires_video(tmp_path):
