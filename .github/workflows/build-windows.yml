@@ -9,8 +9,8 @@ on:
 # To use GitHub's cloud runner instead, change the line below to:
 #   runs-on: windows-latest
 # (note: private repos burn Actions minutes 2x on Windows cloud runners)
-# The self-hosted runner needs Git Bash on its PATH (for the test step);
-# the other script steps use the built-in Windows PowerShell.
+# All script steps use the built-in Windows PowerShell, so the runner needs
+# nothing installed beyond what setup-python provides.
 jobs:
   build:
     runs-on: [self-hosted, Windows]
@@ -27,10 +27,10 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Run tests
-        shell: bash
+        shell: powershell
         env:
           PYTHONPATH: src
-        run: pytest tests/ -q
+        run: python -m pytest tests/ -q
 
       - name: Build with PyInstaller
         run: pyinstaller dance-dub.spec --noconfirm --clean
