@@ -127,13 +127,17 @@ jobs:
 
           Output lands in: <your user folder>\DanceDub\Videos\<video name>\
           "@ | Out-File -FilePath dist\DanceDub\READ-ME-FIRST.txt -Encoding utf8
-          Compress-Archive -Path dist\DanceDub\* -DestinationPath DanceDub-windows.zip -Force
+          # Zip the folder itself so unzipping gives one tidy DanceDub folder.
+          Compress-Archive -Path dist\DanceDub -DestinationPath DanceDub-windows.zip -Force
 
+      # Artifacts are always zipped on download, so upload the folder (not our
+      # zip) to avoid a zip inside a zip. dist/ holds only DanceDub/, so the
+      # download unzips to a single DanceDub folder.
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: DanceDub-windows
-          path: DanceDub-windows.zip
+          path: dist/
 
       - name: Attach to release (on tags)
         if: startsWith(github.ref, 'refs/tags/')

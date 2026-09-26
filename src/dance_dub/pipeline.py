@@ -167,10 +167,81 @@ def _escape_filter_path(path: Path) -> str:
     return p
 
 
+_VIDEO_SIZE_RE = re.compile(r"Video: .*?, (\d{2,5})x(\d{2,5})")
+_ROTATION_RE = re.compile(r"(?:rotation of|rotate\s*:)\s*(-?\d+(?:\.\d+)?)")
+
+
+def probe_video_size(ffmpeg: str, video: Path) -> Optional[Tuple[int, int]]:
+    """(width, height) as the video is displayed (phone rotation applied)."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(video)],
+        capture_output=True, text=True, errors="replace", creationflags=flags,
+    )
+    m = _VIDEO_SIZE_RE.search(proc.stderr)
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    rot = _ROTATION_RE.search(proc.stderr)
+    if rot and round(abs(float(rot.group(1)))) % 180 == 90:
+        w, h = h, w
+    return w, h
+
+
+def _ass_time(h: str, m: str, s: str, ms: str) -> str:
+    cs = int(ms.ljust(3, "0")) // 10
+    return f"{int(h)}:{m}:{s}.{cs:02d}"
+
+
+def srt_to_ass(srt_text: str, width: int, height: int) -> str:
+    """Convert SRT to ASS laid out in the video's own pixels.
+
+    Burning plain SRT makes libass size text against a 384x288 canvas scaled
+    to the video's height, so on a tall phone video the captions came out
+    huge. Here the canvas is the video itself, and the font is a fixed share
+    of its shorter side, so captions look the same on portrait and landscape.
+    """
+    short = min(width, height)
+    size = max(12, round(short * 0.055))
+    outline = max(1, round(size * 0.08))
+    margin_v = round(height * 0.06)
+    margin_lr = round(width * 0.06)
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+        "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,Arial,{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_lr},{margin_lr},{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for _, timespan, text in parse_srt(srt_text):
+        t = _SRT_TIME_RE.search(timespan)
+        if not t or not text.strip():
+            continue
+        start, end = _ass_time(*t.groups()[:4]), _ass_time(*t.groups()[4:])
+        # Braces start ASS override tags; keep them as literal text.
+        body = text.strip().replace("{", "(").replace("}", ")").replace("\n", "\\N")
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{body}")
+    return "\n".join(lines) + "\n"
+
+
 def burn_cmd(
-    ffmpeg: str, video: Path, srt: Path, out: Path, style: str = DEFAULT_STYLE
+    ffmpeg: str, video: Path, srt: Path, out: Path, style: Optional[str] = DEFAULT_STYLE
 ) -> List[str]:
-    vf = f"subtitles='{_escape_filter_path(srt)}':force_style='{style}'"
+    vf = f"subtitles='{_escape_filter_path(srt)}'"
+    if style:
+        vf += f":force_style='{style}'"
     return [
         ffmpeg,
         "-y",
@@ -608,7 +679,7 @@ def translate_srt_file(
 
 def burn_subtitles(
     workdir: Path,
-    style: str = DEFAULT_STYLE,
+    style: Optional[str] = None,
     log: LogFn = default_log,
     force: bool = False,
 ) -> Path:
@@ -631,7 +702,17 @@ def burn_subtitles(
     if out.exists() and not force:
         log(f"[burn] {out.name} exists, skipping")
         return out
-    cmd = burn_cmd(ffmpeg_exe(), video, srt, out, style)
+    ffmpeg = ffmpeg_exe()
+    subs, burn_style = srt, style or DEFAULT_STYLE
+    if style is None:
+        size = probe_video_size(ffmpeg, video)
+        if size:
+            subs = workdir / "subtitles.ass"
+            subs.write_text(
+                srt_to_ass(srt.read_text(encoding="utf-8"), *size), encoding="utf-8"
+            )
+            burn_style = None
+    cmd = burn_cmd(ffmpeg, video, subs, out, burn_style)
     log(f"[burn] burning subtitles from {srt.name} (this re-encodes the video)…")
     _run_ffmpeg(cmd, log)
     log(f"[burn] wrote {out.name}")
@@ -648,7 +729,7 @@ def start_from_file(
     target_lang: str = "en",
     source_lang: str = "auto",
     model_size: str = "small",
-    style: str = DEFAULT_STYLE,
+    style: Optional[str] = None,
     log: LogFn = default_log,
 ) -> Path:
     """Run stages 2-5 on a video already on disk. Returns the final video path."""
@@ -679,7 +760,7 @@ def run_pipeline(
     target_lang: str = "en",
     source_lang: str = "auto",
     model_size: str = "small",
-    style: str = DEFAULT_STYLE,
+    style: Optional[str] = None,
     log: LogFn = default_log,
 ) -> Path:
     """Run stages 2-5 inside an existing workdir (assumes video present)."""
@@ -700,7 +781,7 @@ def run_all(
     target_lang: str = "en",
     source_lang: str = "auto",
     model_size: str = "small",
-    style: str = DEFAULT_STYLE,
+    style: Optional[str] = None,
     log: LogFn = default_log,
 ) -> Path:
     """Run the full pipeline for one URL. Returns the final video path."""
