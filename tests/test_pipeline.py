@@ -198,6 +198,31 @@ def test_translate_srt_preserves_timestamps(tmp_path):
     assert blocks[0][1] == "00:00:01,000 --> 00:00:02,000"  # untouched
 
 
+def test_translate_uses_detected_language_as_source(tmp_path):
+    srt = tmp_path / "transcript.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nbonjour\n", encoding="utf-8")
+    (tmp_path / "detected_language.txt").write_text("fr", encoding="utf-8")
+    seen = []
+
+    def factory(source, target):
+        seen.append((source, target))
+        return _UpperTranslator(source, target)
+
+    P.translate_srt_file(srt, "en", log=lambda m: None, translator_factory=factory)
+    assert seen == [("fr", "en")]
+
+
+def test_translate_keeps_text_when_already_target_language(tmp_path):
+    srt = tmp_path / "transcript.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
+    (tmp_path / "detected_language.txt").write_text("en", encoding="utf-8")
+    out = P.translate_srt_file(
+        srt, "en", log=lambda m: None,
+        translator_factory=lambda s, t: (_ for _ in ()).throw(AssertionError()),
+    )
+    assert P.parse_srt(out.read_text(encoding="utf-8"))[0][2] == "hello"
+
+
 def test_translate_skips_existing(tmp_path):
     srt = tmp_path / "transcript.srt"
     srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nhola\n")

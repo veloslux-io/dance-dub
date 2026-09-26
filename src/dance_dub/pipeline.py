@@ -522,6 +522,16 @@ def translate_srt_file(
         out_path.write_text("", encoding="utf-8")
         return out_path
 
+    # Use the language Whisper detected rather than "auto": the fallback
+    # provider (MyMemory) can't auto-detect and would treat the text as
+    # English, handing French back untranslated when the target is English.
+    if source_lang in ("auto", "", None):
+        source_lang = read_detected_language(srt_path.parent) or "auto"
+    if source_lang.split("-")[0].lower() == target_lang.split("-")[0].lower():
+        log(f"[translate] already in {target_lang}, keeping the original text")
+        out_path.write_text(write_srt(blocks), encoding="utf-8")
+        return out_path
+
     translator = translator_factory(source_lang, target_lang)
 
     # Batch: join many subtitle lines with a separator so one request covers
@@ -541,7 +551,8 @@ def translate_srt_file(
         batches.append(current)
 
     translated = list(texts)
-    log(f"[translate] {len(blocks)} cues in {len(batches)} request(s) → {target_lang}")
+    log(f"[translate] {len(blocks)} cues in {len(batches)} request(s), "
+        f"{source_lang} → {target_lang}")
     for bi, batch in enumerate(batches, start=1):
         joined = _BATCH_SEP.join(texts[i] for i in batch)
         result = joined

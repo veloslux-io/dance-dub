@@ -157,6 +157,13 @@ def handle_start(payload: dict) -> tuple[bool, str]:
     return False, f"Unknown mode: {mode}"
 
 
+def _quit() -> None:
+    """Stop the app. The packaged exe has no window, so this (the page's Quit
+    button) is how users end it; os._exit also stops a job mid-run."""
+    time.sleep(0.3)  # let the /api/quit response reach the browser
+    os._exit(0)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # silence default request logging
         pass
@@ -198,6 +205,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/open":
             err = _open_folder(payload.get("path") or "")
             self._json({"ok": not err, "message": err})
+        elif self.path == "/api/quit":
+            self._json({"ok": True})
+            threading.Thread(target=_quit, daemon=True).start()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -327,6 +337,12 @@ INDEX_HTML = """<!doctype html>
     float: right; background: none; border: 1px solid currentColor; color: inherit;
     border-radius: 7px; padding: 2px 10px; cursor: pointer; font-size: 12px;
   }
+  header .quit {
+    margin-left: auto; padding: 7px 14px; border-radius: 9px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel2); color: var(--muted);
+    font-size: 12.5px;
+  }
+  header .quit:hover { color: var(--text); border-color: var(--err); }
   footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 18px; }
 </style>
 </head>
@@ -338,6 +354,7 @@ INDEX_HTML = """<!doctype html>
       <h1>Dance Dub</h1>
       <div class="sub">Download a Wix video or pick a file — get it transcribed, translated &amp; subtitled.</div>
     </div>
+    <button class="quit" onclick="quitApp()" title="Stop Dance Dub running in the background">Quit</button>
   </header>
 
   <div id="banner" class="banner"></div>
@@ -462,6 +479,20 @@ function pick(f) {
     });
 }
 
+async function quitApp() {
+  let running = false;
+  try { running = (await (await fetch('/api/status')).json()).status.running; } catch (e) {}
+  const msg = running
+    ? 'A video is still being processed. Quit anyway? The job will stop.'
+    : 'Quit Dance Dub? It stops running in the background.';
+  if (!confirm(msg)) return;
+  if (TIMER) clearInterval(TIMER);
+  try { await fetch('/api/quit', { method: 'POST', body: '{}' }); } catch (e) {}
+  document.querySelector('.wrap').innerHTML =
+    '<header><div class="logo">💃</div><div><h1>Dance Dub has closed</h1>' +
+    '<div class="sub">You can close this tab. Double-click DanceDub.exe to start it again.</div></div></header>';
+}
+
 async function start() {
   let body;
   if (MODE === 'url') {
@@ -561,8 +592,16 @@ def main() -> None:
     port = int(os.environ.get("DANCE_DUB_PORT") or 8756)
     Handler.protocol_version = "HTTP/1.1"
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        # Port taken: most likely Dance Dub is already running (the exe has
+        # no window, so people double-click it again). Show that copy.
+        print(f"Port {port} is in use; opening the running copy at {url}")
+        if not os.environ.get("DANCE_DUB_NO_BROWSER"):
+            webbrowser.open(url)
+        return
     print(f"Dance Dub v{__version__} — serving on {url}")
     if not os.environ.get("DANCE_DUB_NO_BROWSER"):
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
