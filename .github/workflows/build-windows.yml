@@ -9,6 +9,8 @@ on:
 # To use GitHub's cloud runner instead, change the line below to:
 #   runs-on: windows-latest
 # (note: private repos burn Actions minutes 2x on Windows cloud runners)
+# The self-hosted runner needs Git Bash on its PATH (for the test step);
+# the other script steps use the built-in Windows PowerShell.
 jobs:
   build:
     runs-on: [self-hosted, Windows]
@@ -34,7 +36,7 @@ jobs:
         run: pyinstaller dance-dub.spec --noconfirm --clean
 
       - name: Smoke-test the exe (server starts, index serves)
-        shell: pwsh
+        shell: powershell
         run: |
           $proc = Start-Process -FilePath "dist\DanceDub\DanceDub.exe" -PassThru
           $ok = $false
@@ -50,7 +52,7 @@ jobs:
           Write-Host "Smoke test OK — DanceDub.exe serving on 127.0.0.1:8756"
 
       - name: Package zip
-        shell: pwsh
+        shell: powershell
         run: |
           # README for inside the zip
           @"
