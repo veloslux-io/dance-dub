@@ -336,30 +336,30 @@ def test_run_all_order(tmp_path, monkeypatch):
     calls = []
 
     monkeypatch.setattr(
-        P, "download_video", lambda url, wd, log=None: calls.append("download")
+        P, "download_video", lambda url, wd, log=None, **kw: calls.append("download")
         or (wd / "video.mp4").write_bytes(b"v")
         or wd / "video.mp4",
     )
     monkeypatch.setattr(
         P, "extract_audio",
-        lambda wd, log=None: calls.append("extract")
+        lambda wd, log=None, **kw: calls.append("extract")
         or (wd / "audio.wav").write_bytes(b"a")
         or wd / "audio.wav",
     )
     monkeypatch.setattr(
         P, "transcribe_audio",
-        lambda wd, model_size="small", log=None: calls.append("transcribe")
+        lambda wd, model_size="small", log=None, **kw: calls.append("transcribe")
         or (wd / "transcript.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n")
         or wd / "transcript.srt",
     )
     monkeypatch.setattr(
         P, "translate_srt_file",
-        lambda srt, target_lang, source_lang="auto", log=None: calls.append("translate")
+        lambda srt, target_lang, source_lang="auto", log=None, **kw: calls.append("translate")
         or srt.with_name("transcript_translated.srt"),
     )
     monkeypatch.setattr(
         P, "burn_subtitles",
-        lambda wd, style=None, log=None: calls.append("burn")
+        lambda wd, style=None, log=None, **kw: calls.append("burn")
         or wd / f"final_{wd.name}.mp4",
     )
 

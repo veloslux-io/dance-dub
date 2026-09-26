@@ -11,10 +11,29 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 LogFn = Callable[[str], None]
+# progress(stage, fraction 0..1 or None when unknown, short detail text)
+ProgressFn = Callable[[str, Optional[float], str], None]
+
+
+def no_progress(stage: str, fraction: Optional[float], detail: str) -> None:
+    pass
+
+
+def _mb(done: float, total: Optional[float] = None) -> str:
+    if total:
+        return f"{done / 1e6:.0f} / {total / 1e6:.0f} MB"
+    return f"{done / 1e6:.0f} MB"
+
+
+def _clock(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
 
 DEFAULT_STYLE = (
     "FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,"
@@ -280,19 +299,25 @@ def find_wix_video_urls(page_url: str, html: str) -> List[str]:
     return sorted(seen, key=quality, reverse=True)
 
 
-def _download_direct(url: str, dest: Path) -> None:
+def _download_direct(url: str, dest: Path, progress: ProgressFn = no_progress) -> None:
     """Stream a direct file URL to dest with urllib (no external deps)."""
     import urllib.request
 
     with urllib.request.urlopen(url, timeout=60) as resp, open(dest, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0) or None
+        done = 0
         while True:
             chunk = resp.read(1 << 20)
             if not chunk:
                 break
             f.write(chunk)
+            done += len(chunk)
+            progress("download", done / total if total else None, _mb(done, total))
 
 
-def _wix_scrape_fallback(page_url: str, workdir: Path, log: LogFn) -> None:
+def _wix_scrape_fallback(
+    page_url: str, workdir: Path, log: LogFn, progress: ProgressFn = no_progress
+) -> None:
     """Last resort: fetch the page HTML and pull direct wixstatic MP4 URLs."""
     import urllib.request
 
@@ -315,7 +340,7 @@ def _wix_scrape_fallback(page_url: str, workdir: Path, log: LogFn) -> None:
         dest = workdir / "video.mp4"
         try:
             log(f"[download] direct download: {candidate}")
-            _download_direct(candidate, dest)
+            _download_direct(candidate, dest, progress)
             if dest.stat().st_size > 10_000:  # plausible video, not an error page
                 return
             dest.unlink(missing_ok=True)
@@ -323,11 +348,23 @@ def _wix_scrape_fallback(page_url: str, workdir: Path, log: LogFn) -> None:
             log(f"[download] candidate failed: {exc}")
 
 
+def _ytdlp_progress_hook(progress: ProgressFn):
+    def hook(d: dict) -> None:
+        if d.get("status") != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        done = d.get("downloaded_bytes") or 0
+        progress("download", min(done / total, 1.0) if total else None, _mb(done, total))
+
+    return hook
+
+
 def download_video(
     url: str,
     workdir: Path,
     log: LogFn = default_log,
     force: bool = False,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     """Download `url` into workdir as video.<ext>. Returns the video path."""
     import yt_dlp
@@ -347,6 +384,7 @@ def download_video(
         "fragment_retries": 5,
         "quiet": True,
         "no_warnings": True,
+        "progress_hooks": [_ytdlp_progress_hook(progress)],
     }
     # Merging separate video+audio streams needs ffmpeg; point yt-dlp at the
     # bundled one so it works on machines without ffmpeg on PATH.
@@ -360,7 +398,7 @@ def download_video(
             ydl.download([url])
     except Exception as exc:
         log(f"[download] yt-dlp failed ({type(exc).__name__}); trying Wix page scrape…")
-        _wix_scrape_fallback(url, workdir, log)
+        _wix_scrape_fallback(url, workdir, log, progress)
 
     video = find_video(workdir)
     if not video:
@@ -377,21 +415,77 @@ def download_video(
 # Stage 2: extract audio
 # --------------------------------------------------------------------------
 
-def _run_ffmpeg(cmd: List[str], log: LogFn) -> None:
-    """Run ffmpeg, surfacing its stderr on failure instead of a bare traceback."""
+_DURATION_RE = re.compile(r"Duration: (\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+
+
+def probe_duration(ffmpeg: str, media: Path) -> Optional[float]:
+    """Length of a media file in seconds, read from ffmpeg's banner."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(media)],
+        capture_output=True, text=True, errors="replace", creationflags=flags,
+    )
+    m = _DURATION_RE.search(proc.stderr)
+    if not m:
+        return None
+    seconds = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    return seconds or None
+
+
+def _run_ffmpeg(
+    cmd: List[str],
+    log: LogFn,
+    on_progress: Optional[Callable[[float, float], None]] = None,
+    duration: Optional[float] = None,
+) -> None:
+    """Run ffmpeg, surfacing its stderr on failure instead of a bare traceback.
+
+    With on_progress and a known duration, ffmpeg's -progress output is read
+    as it runs and on_progress(fraction, seconds_done) is called.
+    """
+    import tempfile
+
     # CREATE_NO_WINDOW: the packaged exe has no console, so without it every
     # ffmpeg call would flash a black console window on Windows.
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
-    if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.splitlines()[-12:])
-        raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}):\n{tail}")
+    if not (on_progress and duration):
+        proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+        returncode, stderr = proc.returncode, proc.stderr
+    else:
+        cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+        # stderr goes to a file so a chatty ffmpeg can't fill the pipe and stall.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as err:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=err, text=True,
+                errors="replace", creationflags=flags,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                if key in ("out_time_us", "out_time_ms") and value.isdigit():
+                    done = int(value) / 1e6  # both are microseconds
+                    on_progress(min(done / duration, 1.0), min(done, duration))
+            returncode = proc.wait()
+            err.seek(0)
+            stderr = err.read()
+    if returncode != 0:
+        tail = "\n".join(stderr.splitlines()[-12:])
+        raise RuntimeError(f"ffmpeg failed (exit {returncode}):\n{tail}")
+
+
+def _ffmpeg_progress(stage: str, progress: ProgressFn, duration: Optional[float]):
+    if not duration:
+        return None
+    return lambda frac, done: progress(
+        stage, frac, f"{_clock(done)} / {_clock(duration)}"
+    )
 
 
 def extract_audio(
     workdir: Path,
     log: LogFn = default_log,
     force: bool = False,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     video = find_video(workdir)
     if not video:
@@ -400,9 +494,11 @@ def extract_audio(
     if audio.exists() and not force:
         log("[extract] audio.wav exists, skipping")
         return audio
-    cmd = extract_audio_cmd(ffmpeg_exe(), video, audio)
+    ffmpeg = ffmpeg_exe()
+    cmd = extract_audio_cmd(ffmpeg, video, audio)
     log("[extract] extracting audio (16 kHz mono)")
-    _run_ffmpeg(cmd, log)
+    duration = probe_duration(ffmpeg, video)
+    _run_ffmpeg(cmd, log, _ffmpeg_progress("extract", progress, duration), duration)
     log("[extract] done")
     return audio
 
@@ -410,6 +506,55 @@ def extract_audio(
 # --------------------------------------------------------------------------
 # Stage 3: transcribe
 # --------------------------------------------------------------------------
+
+@contextmanager
+def _model_download_progress(progress: ProgressFn):
+    """Report the speech model's first-run download (hundreds of MB).
+
+    faster-whisper hands huggingface_hub a silenced tqdm class for that
+    download; swap in one that forwards its byte counts to `progress`. If a
+    future faster-whisper stops using that hook, this simply reports nothing.
+    """
+    try:
+        from faster_whisper import utils as fw_utils
+        from tqdm.auto import tqdm
+    except Exception:
+        yield
+        return
+
+    # huggingface_hub may drive more than one byte bar (network vs. written);
+    # report the furthest along so the bar never moves backwards.
+    best = {"frac": 0.0}
+
+    class _Reporting(tqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs.pop("name", None)
+            self._unit = kwargs.get("unit", "it")
+            self._done = kwargs.get("initial", 0) or 0
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            self._done += n or 0
+            if self._unit == "B" and self.total:
+                frac = min(self._done / self.total, 1.0)
+                if frac >= best["frac"]:
+                    best["frac"] = frac
+                    progress(
+                        "transcribe", frac,
+                        "Downloading speech model (first run only) "
+                        + _mb(self._done, self.total),
+                    )
+            return super().update(n)
+
+    original = getattr(fw_utils, "disabled_tqdm", None)
+    fw_utils.disabled_tqdm = _Reporting
+    try:
+        yield
+    finally:
+        if original is not None:
+            fw_utils.disabled_tqdm = original
+
 
 def _is_missing_cuda(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -422,6 +567,7 @@ def transcribe_audio(
     log: LogFn = default_log,
     force: bool = False,
     model_factory=None,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     """Transcribe audio.wav → transcript.srt + transcript.txt. Returns SRT path."""
     audio = workdir / "audio.wav"
@@ -445,11 +591,21 @@ def transcribe_audio(
 
     def run(model):
         segments_iter, info = model.transcribe(str(audio), vad_filter=True)
-        return [(seg.start, seg.end, seg.text) for seg in segments_iter], info
+        total = getattr(info, "duration", 0) or 0
+        segments = []
+        for seg in segments_iter:
+            segments.append((seg.start, seg.end, seg.text))
+            if total:
+                done = min(seg.end, total)
+                progress("transcribe", done / total, f"{_clock(done)} / {_clock(total)}")
+        return segments, info
 
     log(f"[transcribe] loading model '{model_size}' (first run downloads it)")
-    model = model_factory(model_size)
+    progress("transcribe", None, "Loading speech model")
+    with _model_download_progress(progress):
+        model = model_factory(model_size)
     log("[transcribe] transcribing…")
+    progress("transcribe", 0.0, "Transcribing")
     try:
         segments, info = run(model)
     except RuntimeError as exc:
@@ -575,6 +731,7 @@ def translate_srt_file(
     log: LogFn = default_log,
     force: bool = False,
     translator_factory=None,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     """Translate an SRT file, preserving indices and timestamps. Returns new path."""
     out_path = srt_path.with_name(srt_path.stem + "_translated.srt")
@@ -624,6 +781,7 @@ def translate_srt_file(
     translated = list(texts)
     log(f"[translate] {len(blocks)} cues in {len(batches)} request(s), "
         f"{source_lang} → {target_lang}")
+    progress("translate", 0.0, "Translating")
     for bi, batch in enumerate(batches, start=1):
         joined = _BATCH_SEP.join(texts[i] for i in batch)
         result = joined
@@ -664,6 +822,7 @@ def translate_srt_file(
                 for i, part in zip(batch, parts):
                     translated[i] = part
         log(f"[translate] batch {bi}/{len(batches)} done")
+        progress("translate", bi / len(batches), f"part {bi} of {len(batches)}")
 
     out_blocks = [
         (blocks[i][0], blocks[i][1], translated[i]) for i in range(len(blocks))
@@ -682,6 +841,7 @@ def burn_subtitles(
     style: Optional[str] = None,
     log: LogFn = default_log,
     force: bool = False,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     video = find_video(workdir)
     if not video:
@@ -714,7 +874,9 @@ def burn_subtitles(
             burn_style = None
     cmd = burn_cmd(ffmpeg, video, subs, out, burn_style)
     log(f"[burn] burning subtitles from {srt.name} (this re-encodes the video)…")
-    _run_ffmpeg(cmd, log)
+    duration = probe_duration(ffmpeg, video)
+    progress("burn", 0.0 if duration else None, "Adding subtitles")
+    _run_ffmpeg(cmd, log, _ffmpeg_progress("burn", progress, duration), duration)
     log(f"[burn] wrote {out.name}")
     return out
 
@@ -731,6 +893,7 @@ def start_from_file(
     model_size: str = "small",
     style: Optional[str] = None,
     log: LogFn = default_log,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     """Run stages 2-5 on a video already on disk. Returns the final video path."""
     video_path = Path(video_path).expanduser().resolve()
@@ -752,7 +915,8 @@ def start_from_file(
         shutil.copy2(video_path, dest)
         log(f"[download] copied {video_path.name} into {workdir.name}")
     return run_pipeline(workdir, target_lang=target_lang, source_lang=source_lang,
-                        model_size=model_size, style=style, log=log)
+                        model_size=model_size, style=style, log=log,
+                        progress=progress)
 
 
 def run_pipeline(
@@ -762,17 +926,19 @@ def run_pipeline(
     model_size: str = "small",
     style: Optional[str] = None,
     log: LogFn = default_log,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     """Run stages 2-5 inside an existing workdir (assumes video present)."""
-    extract_audio(workdir, log=log)
-    transcribe_audio(workdir, model_size=model_size, log=log)
+    extract_audio(workdir, log=log, progress=progress)
+    transcribe_audio(workdir, model_size=model_size, log=log, progress=progress)
     translate_srt_file(
         workdir / "transcript.srt",
         target_lang=target_lang,
         source_lang=source_lang,
         log=log,
+        progress=progress,
     )
-    return burn_subtitles(workdir, style=style, log=log)
+    return burn_subtitles(workdir, style=style, log=log, progress=progress)
 
 
 def run_all(
@@ -783,10 +949,12 @@ def run_all(
     model_size: str = "small",
     style: Optional[str] = None,
     log: LogFn = default_log,
+    progress: ProgressFn = no_progress,
 ) -> Path:
     """Run the full pipeline for one URL. Returns the final video path."""
     workdir = out_root / slugify(url)
     workdir.mkdir(parents=True, exist_ok=True)
-    download_video(url, workdir, log=log)
+    download_video(url, workdir, log=log, progress=progress)
     return run_pipeline(workdir, target_lang=target_lang, source_lang=source_lang,
-                        model_size=model_size, style=style, log=log)
+                        model_size=model_size, style=style, log=log,
+                        progress=progress)

@@ -39,6 +39,8 @@ class JobManager:
             "running": False, "stage": None, "error": None, "done": False,
             "result": None, "started_at": None, "finished_at": None,
             "kind": None, "label": None, "stages_done": [],
+            # {"stage", "pct" (0-100 or None when unknown), "detail"}
+            "progress": None,
         }
 
     def _set(self, **kw) -> None:
@@ -53,7 +55,7 @@ class JobManager:
                 del self.log_lines[: len(self.log_lines) - MAX_LOG_LINES]
 
     def start(self, kind: str, label: str, runner) -> bool:
-        """Start a job if none running. `runner(log_fn)` does the work."""
+        """Start a job if none running. `runner(log_fn, progress_fn)` does the work."""
         with self.lock:
             if self.status["running"]:
                 return False
@@ -72,20 +74,27 @@ class JobManager:
                         done = list(self.status.get("stages_done") or [])
                         if stage not in done:
                             done.append(stage)
+                        if self.status["stage"] != stage:
+                            self.status["progress"] = None
                         self.status["stage"] = stage
                         self.status["stages_done"] = done
                     break
 
+        def progress_fn(stage: str, fraction, detail: str) -> None:
+            pct = None if fraction is None else round(fraction * 100, 1)
+            with self.lock:
+                self.status["progress"] = {"stage": stage, "pct": pct, "detail": detail}
+
         def worker() -> None:
             try:
-                result = runner(log_fn)
+                result = runner(log_fn, progress_fn)
                 self._set(done=True, result=str(result), finished_at=time.time())
                 self.log(f"✔ Finished — {result}")
             except Exception as exc:
                 self._set(error=str(exc), finished_at=time.time())
                 self.log(f"✖ ERROR: {exc}")
             finally:
-                self._set(running=False, stage=None)
+                self._set(running=False, stage=None, progress=None)
 
         threading.Thread(target=worker, daemon=True).start()
         return True
@@ -128,11 +137,12 @@ def handle_start(payload: dict) -> tuple[bool, str]:
             return False, "Paste a video URL first."
         workdir = out_root / P.slugify(url)
 
-        def runner(log_fn):
+        def runner(log_fn, progress_fn):
             workdir.mkdir(parents=True, exist_ok=True)
-            P.download_video(url, workdir, log=log_fn)
+            P.download_video(url, workdir, log=log_fn, progress=progress_fn)
             return P.run_pipeline(
-                workdir, target_lang=target, model_size=model, log=log_fn
+                workdir, target_lang=target, model_size=model, log=log_fn,
+                progress=progress_fn,
             )
 
         started = JM.start(f"Wix URL — {url}", workdir.name, runner)
@@ -146,9 +156,10 @@ def handle_start(payload: dict) -> tuple[bool, str]:
         if not path.is_file():
             return False, f"File not found: {path}"
 
-        def runner(log_fn):
+        def runner(log_fn, progress_fn):
             return P.start_from_file(
-                path, out_root, target_lang=target, model_size=model, log=log_fn
+                path, out_root, target_lang=target, model_size=model, log=log_fn,
+                progress=progress_fn,
             )
 
         started = JM.start(f"Local file — {path.name}", path.name, runner)
@@ -322,6 +333,22 @@ INDEX_HTML = """<!doctype html>
   .stage.active { border-color: var(--accent); color: var(--text);
     background: color-mix(in srgb, var(--accent) 16%, var(--panel2)); }
   .stage.done { border-color: color-mix(in srgb, var(--ok) 60%, var(--line)); color: var(--ok); }
+  .progress { margin-top: 12px; }
+  .progress[hidden] { display: none; }
+  .pbar {
+    height: 8px; border-radius: 99px; overflow: hidden;
+    background: var(--panel2); border: 1px solid var(--line);
+  }
+  .pfill {
+    height: 100%; width: 0; transition: width .3s;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+  }
+  .pbar.indet .pfill { width: 35%; animation: indet 1.2s ease-in-out infinite; }
+  @keyframes indet { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+  .ptext {
+    display: flex; justify-content: space-between; gap: 10px;
+    margin-top: 5px; font-size: 12px; color: var(--muted);
+  }
   #log {
     background: #0b0d11; border: 1px solid var(--line); border-radius: 10px;
     padding: 12px; height: 240px; overflow-y: auto;
@@ -416,6 +443,11 @@ INDEX_HTML = """<!doctype html>
       <div class="stage" id="st-translate"><span class="n">🌐</span>Translate</div>
       <div class="stage" id="st-burn"><span class="n">🎬</span>Subtitles</div>
     </div>
+
+    <div class="progress" id="prog" hidden>
+      <div class="pbar" id="pbar"><div class="pfill" id="pfill"></div></div>
+      <div class="ptext"><span id="plabel"></span><span id="ppct"></span></div>
+    </div>
   </div>
 
   <div class="card">
@@ -461,22 +493,55 @@ function pick(f) {
     return banner('err', 'That doesn\\'t look like a video file (want .mp4, .mov, .mkv, .webm or .m4v).');
   PICKED = { name: f.name, path: null };
   document.getElementById('filePath').textContent = f.name + ' — uploading…';
-  fetch('/api/upload?name=' + encodeURIComponent(f.name), { method: 'POST', body: f })
-    .then(r => r.json())
-    .then(j => {
-      if (j.ok) {
-        PICKED.path = j.path;
-        document.getElementById('filePath').textContent = f.name + ' ✓ ready';
-      } else {
-        PICKED = null;
-        document.getElementById('filePath').textContent = '';
-        banner('err', 'Upload failed: ' + (j.error || 'unknown error'));
-      }
-    })
-    .catch(e => {
+  // XHR rather than fetch: only XHR reports upload progress.
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload?name=' + encodeURIComponent(f.name));
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable)
+      showProgress('upload', e.loaded / e.total * 100, mb(e.loaded) + ' / ' + mb(e.total) + ' MB');
+  };
+  xhr.onload = () => {
+    showProgress(null);
+    let j = {};
+    try { j = JSON.parse(xhr.responseText); } catch (e) {}
+    if (j.ok) {
+      PICKED.path = j.path;
+      document.getElementById('filePath').textContent = f.name + ' ✓ ready';
+    } else {
       PICKED = null;
-      banner('err', 'Upload failed: ' + e);
-    });
+      document.getElementById('filePath').textContent = '';
+      banner('err', 'Upload failed: ' + (j.error || 'unknown error'));
+    }
+  };
+  xhr.onerror = () => {
+    showProgress(null);
+    PICKED = null;
+    document.getElementById('filePath').textContent = '';
+    banner('err', 'Upload failed: could not reach Dance Dub.');
+  };
+  xhr.send(f);
+}
+
+function mb(bytes) { return (bytes / 1e6).toFixed(0); }
+
+const STAGE_NAMES = {
+  upload: 'Uploading', download: 'Downloading', extract: 'Extracting audio',
+  transcribe: 'Transcribing', translate: 'Translating', burn: 'Adding subtitles',
+};
+
+// pct: 0-100, or null for "working, amount unknown" (animated bar).
+function showProgress(stage, pct, detail) {
+  const box = document.getElementById('prog');
+  if (!stage) { box.hidden = true; return; }
+  box.hidden = false;
+  document.getElementById('pbar').classList.toggle('indet', pct == null);
+  document.getElementById('pfill').style.width = pct == null ? '' : pct + '%';
+  // Details that are just numbers ("0:10 / 0:40", "12 / 48 MB") get the step
+  // name in front; full phrases ("Downloading speech model…") stand alone.
+  const name = STAGE_NAMES[stage] || stage;
+  const label = !detail ? name : /^[0-9a-z]/.test(detail) ? name + ' · ' + detail : detail;
+  document.getElementById('plabel').textContent = label;
+  document.getElementById('ppct').textContent = pct == null ? '' : Math.floor(pct) + '%';
 }
 
 async function quitApp() {
@@ -542,6 +607,11 @@ async function poll() {
     el.classList.toggle('done', i <= doneIdx && !!(st.stages_done && st.stages_done.length));
     el.classList.toggle('active', st.running && s === st.stage);
   });
+
+  const p = st.progress;
+  if (st.running && p) showProgress(p.stage, p.pct, p.detail);
+  else if (st.running && st.stage) showProgress(st.stage, null, '');
+  else showProgress(null);
 
   if (!st.running && TIMER) {
     clearInterval(TIMER); TIMER = null;
