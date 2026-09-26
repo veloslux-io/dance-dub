@@ -13,7 +13,10 @@ hiddenimports = [
     "dance_dub.app",
     "dance_dub.cli",
 ]
-for pkg in ("ctranslate2", "imageio_ffmpeg", "onnxruntime", "tokenizers", "tqdm"):
+# faster_whisper ships its Silero VAD model (assets/*.onnx) as package data.
+for pkg in (
+    "ctranslate2", "faster_whisper", "imageio_ffmpeg", "onnxruntime", "tokenizers", "tqdm",
+):
     pkg_datas, pkg_bins, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_bins

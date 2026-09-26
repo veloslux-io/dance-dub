@@ -556,13 +556,16 @@ def build_index() -> str:
 
 
 def main() -> None:
-    port = 8756
+    # Overridable so CI can test the exe without clashing with a copy the
+    # user already has open, and without popping browser tabs.
+    port = int(os.environ.get("DANCE_DUB_PORT") or 8756)
     Handler.protocol_version = "HTTP/1.1"
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
     print(f"Dance Dub v{__version__} — serving on {url}")
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    if not os.environ.get("DANCE_DUB_NO_BROWSER"):
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
