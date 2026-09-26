@@ -52,8 +52,16 @@ jobs:
               if ($r.StatusCode -eq 200) { $ok = $true; break }
             } catch {}
           }
-          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw "Smoke test failed: server never responded" }
+          if (-not $ok) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Smoke test failed: server never responded"
+          }
+          # The Quit button must actually end the background process.
+          Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$env:DANCE_DUB_PORT/api/quit" -Body "{}" | Out-Null
+          if (-not $proc.WaitForExit(10000)) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Smoke test failed: /api/quit did not stop DanceDub.exe"
+          }
           Write-Host "Smoke test OK - DanceDub.exe serving on 127.0.0.1:$env:DANCE_DUB_PORT"
 
       - name: End-to-end test (transcribe, translate, burn a spoken clip)
@@ -111,6 +119,8 @@ jobs:
               unsigned; it only talks to 127.0.0.1 on your own machine.)
           3. Paste a Wix video page URL, or switch to "From a file on this PC"
              and drop a video in. Pick a language, press Start.
+          4. When you're done, click Quit (top right of the page). Dance Dub keeps
+             running in the background until you do.
 
           First transcription downloads the AI model once (~460 MB), then it's cached.
           Everything runs locally: nothing is uploaded anywhere.
