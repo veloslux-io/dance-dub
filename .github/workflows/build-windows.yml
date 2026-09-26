@@ -49,7 +49,7 @@ jobs:
           }
           Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           if (-not $ok) { throw "Smoke test failed: server never responded" }
-          Write-Host "Smoke test OK — DanceDub.exe serving on 127.0.0.1:8756"
+          Write-Host "Smoke test OK - DanceDub.exe serving on 127.0.0.1:8756"
 
       - name: Package zip
         shell: powershell
@@ -59,7 +59,7 @@ jobs:
           Dance Dub
           =========
 
-          1. Unzip this folder anywhere (e.g. C:\Tools\DanceDub) — keep all files together.
+          1. Unzip this folder anywhere (e.g. C:\Tools\DanceDub) and keep all files together.
           2. Double-click DanceDub.exe. Your browser opens the app.
              (If Windows SmartScreen appears: More info -> Run anyway. The app is
               unsigned; it only talks to 127.0.0.1 on your own machine.)
@@ -67,7 +67,7 @@ jobs:
              and drop a video in. Pick a language, press Start.
 
           First transcription downloads the AI model once (~460 MB), then it's cached.
-          Everything runs locally — nothing is uploaded anywhere.
+          Everything runs locally: nothing is uploaded anywhere.
 
           Output lands in: <your user folder>\DanceDub\Videos\<video name>\
           "@ | Out-File -FilePath dist\DanceDub\READ-ME-FIRST.txt -Encoding utf8
