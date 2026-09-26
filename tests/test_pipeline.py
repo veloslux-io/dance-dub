@@ -137,6 +137,26 @@ def test_transcribe_audio_writes_files(tmp_path):
     assert txt == "Hello\nworld"
 
 
+def test_transcribe_falls_back_to_cpu_when_cuda_libs_missing(tmp_path, monkeypatch):
+    import faster_whisper
+
+    class _NoCudaModel(_FakeModel):
+        def transcribe(self, path, vad_filter=None):
+            raise RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
+
+    devices = []
+
+    def fake_whisper(size, device, compute_type):
+        devices.append(device)
+        return _NoCudaModel() if device == "auto" else _FakeModel()
+
+    monkeypatch.setattr(faster_whisper, "WhisperModel", fake_whisper)
+    (tmp_path / "audio.wav").write_bytes(b"x")
+    srt = P.transcribe_audio(tmp_path, log=lambda m: None)
+    assert devices == ["auto", "cpu"]
+    assert "Hello" in srt.read_text(encoding="utf-8")
+
+
 def test_transcribe_skips_when_srt_exists(tmp_path):
     (tmp_path / "audio.wav").write_bytes(b"x")
     (tmp_path / "transcript.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nold\n")

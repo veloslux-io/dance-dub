@@ -340,6 +340,11 @@ def extract_audio(
 # Stage 3: transcribe
 # --------------------------------------------------------------------------
 
+def _is_missing_cuda(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in ("cublas", "cudnn", "cuda"))
+
+
 def transcribe_audio(
     workdir: Path,
     model_size: str = "small",
@@ -357,19 +362,33 @@ def transcribe_audio(
         log("[transcribe] transcript.srt exists, skipping")
         return srt
 
+    cpu_fallback = None
     if model_factory is None:
         from faster_whisper import WhisperModel
 
         def model_factory(size: str):
             return WhisperModel(size, device="auto", compute_type="int8")
 
+        def cpu_fallback(size: str):
+            return WhisperModel(size, device="cpu", compute_type="int8")
+
+    def run(model):
+        segments_iter, info = model.transcribe(str(audio), vad_filter=True)
+        return [(seg.start, seg.end, seg.text) for seg in segments_iter], info
+
     log(f"[transcribe] loading model '{model_size}' (first run downloads it)")
     model = model_factory(model_size)
     log("[transcribe] transcribing…")
-    segments_iter, info = model.transcribe(str(audio), vad_filter=True)
-    segments: List[Tuple[float, float, str]] = []
-    for seg in segments_iter:
-        segments.append((seg.start, seg.end, seg.text))
+    try:
+        segments, info = run(model)
+    except RuntimeError as exc:
+        # device="auto" picks CUDA whenever an NVIDIA GPU is present, but the
+        # CUDA libraries (cuBLAS/cuDNN) are often missing; that only surfaces
+        # once transcription starts. Fall back to the CPU instead of failing.
+        if cpu_fallback is None or not _is_missing_cuda(exc):
+            raise
+        log("[transcribe] GPU libraries not available, using the CPU instead")
+        segments, info = run(cpu_fallback(model_size))
     srt.write_text(build_srt(segments), encoding="utf-8")
     txt.write_text(
         "\n".join(t for _, _, t in segments).strip(), encoding="utf-8"
