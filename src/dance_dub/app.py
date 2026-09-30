@@ -17,7 +17,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from dance_dub import __version__, pipeline as P
+from dance_dub import __version__, pipeline as P, wix_api as W
 
 MAX_LOG_LINES = 500
 
@@ -39,6 +39,7 @@ class JobManager:
             "running": False, "stage": None, "error": None, "done": False,
             "result": None, "started_at": None, "finished_at": None,
             "kind": None, "label": None, "stages_done": [],
+            "folder": None, "item": None,
         }
 
     def _set(self, **kw) -> None:
@@ -66,6 +67,9 @@ class JobManager:
 
         def log_fn(msg: str) -> None:
             self.log(msg)
+            if msg.startswith("[item]"):  # next video of a batch: reset stages
+                self._set(stage=None, stages_done=[], item=msg[6:].strip())
+                return
             for stage in STAGE_ORDER:
                 if msg.startswith(STAGE_PREFIX[stage]):
                     with self.lock:
@@ -79,7 +83,11 @@ class JobManager:
         def worker() -> None:
             try:
                 result = runner(log_fn)
-                self._set(done=True, result=str(result), finished_at=time.time())
+                folder = None
+                if isinstance(result, dict):  # batch jobs: {"result", "folder"}
+                    result, folder = result["result"], result.get("folder")
+                self._set(done=True, result=str(result), folder=folder,
+                          finished_at=time.time())
                 self.log(f"✔ Finished — {result}")
             except Exception as exc:
                 self._set(error=str(exc), finished_at=time.time())
@@ -112,6 +120,63 @@ def _open_folder(path: str) -> str:
     else:
         subprocess.Popen(["xdg-open", str(folder)])
     return ""
+
+
+# Last Wix listing, by item ID: /api/start gets IDs back, not client-sent URLs.
+WIX_ITEMS: dict[str, W.VideoItem] = {}
+
+
+def handle_wix_list(payload: dict) -> dict:
+    """POST /api/wix/list — {api_key, site_id, source: media|programs}."""
+    source = payload.get("source") or "media"
+    try:
+        client = W.WixClient(payload.get("api_key") or "", payload.get("site_id") or "")
+        if source == "programs":
+            items = client.list_program_videos()
+        else:
+            items = client.list_media_videos()
+    except W.WixApiError as exc:
+        return {"ok": False, "message": str(exc)}
+    except Exception as exc:  # malformed responses, network oddities
+        return {"ok": False, "message": f"Could not list videos: {exc}"}
+    WIX_ITEMS.clear()
+    WIX_ITEMS.update({it.id: it for it in items})
+    return {"ok": True, "source": source, "items": [it.to_dict() for it in items]}
+
+
+def wix_workdir(out_root: Path, item: W.VideoItem) -> Path:
+    """Where a Wix video's files go: its Wix folders, then one per video."""
+    # Media Manager names keep their extension ("warmup.mp4"); drop it.
+    name = Path(item.title).stem if item.source == "media" else item.title
+    return out_root.joinpath(*item.path, W.safe_name(name))
+
+
+def run_wix_batch(client: W.WixClient, items: list, out_root: Path,
+                  target: str, model: str, log_fn) -> dict:
+    """Download and process each selected video in turn; one failure doesn't
+    stop the rest."""
+    done, failed = [], []
+    total = len(items)
+    for i, item in enumerate(items, start=1):
+        workdir = wix_workdir(out_root, item)
+        log_fn(f"[item] {i}/{total} {'/'.join(item.path + [item.title])}")
+        try:
+            url = "" if P.find_video(workdir) else client.download_url(item)
+            P.download_file_url(url, workdir, log=log_fn)
+            done.append(P.run_pipeline(
+                workdir, target_lang=target, model_size=model, log=log_fn
+            ))
+        except Exception as exc:
+            failed.append(item.title)
+            log_fn(f"✖ {item.title}: {exc}")
+    if not done:
+        raise RuntimeError(
+            f"None of the {total} video(s) finished. See the progress log."
+        )
+    summary = f"{len(done)} of {total} video(s) subtitled in {out_root}"
+    if failed:
+        summary += f" — failed: {', '.join(failed)}"
+    return {"result": summary, "folder": str(out_root)}
 
 
 def handle_start(payload: dict) -> tuple[bool, str]:
@@ -152,6 +217,29 @@ def handle_start(payload: dict) -> tuple[bool, str]:
             )
 
         started = JM.start(f"Local file — {path.name}", path.name, runner)
+        return started, "" if started else "A job is already running."
+
+    if mode == "wix":
+        ids = payload.get("ids") or []
+        items = [WIX_ITEMS[i] for i in ids if i in WIX_ITEMS]
+        if not ids:
+            return False, "Tick at least one video first."
+        if len(items) != len(ids):
+            return False, "The video list is out of date. Press Load videos again."
+        items = [it for it in items if it.downloadable]
+        if not items:
+            return False, "None of the ticked videos can be downloaded."
+        try:
+            client = W.WixClient(payload.get("api_key") or "",
+                                 payload.get("site_id") or "")
+        except W.WixApiError as exc:
+            return False, str(exc)
+
+        def runner(log_fn):
+            return run_wix_batch(client, items, out_root, target, model, log_fn)
+
+        label = f"{len(items)} video(s)"
+        started = JM.start("Wix site", label, runner)
         return started, "" if started else "A job is already running."
 
     return False, f"Unknown mode: {mode}"
@@ -199,7 +287,9 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._json({"error": "bad json"}, 400)
             return
-        if self.path == "/api/start":
+        if self.path == "/api/wix/list":
+            self._json(handle_wix_list(payload))
+        elif self.path == "/api/start":
             ok, msg = handle_start(payload)
             self._json({"ok": ok, "message": msg})
         elif self.path == "/api/open":
@@ -287,7 +377,7 @@ INDEX_HTML = """<!doctype html>
     background: color-mix(in srgb, var(--accent) 14%, var(--panel2));
   }
   label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 5px; }
-  input[type=text], input[type=url] {
+  input[type=text], input[type=url], input[type=password] {
     width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
     background: var(--panel2); color: var(--text); font-size: 14px; outline: none;
   }
@@ -343,6 +433,40 @@ INDEX_HTML = """<!doctype html>
     font-size: 12.5px;
   }
   header .quit:hover { color: var(--text); border-color: var(--err); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 5px; }
+  .hint a { color: var(--accent2); }
+  .src { display: flex; gap: 8px; margin-top: 12px; }
+  .src button, .small-btn {
+    padding: 8px 12px; border-radius: 9px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--muted); font-size: 13px; cursor: pointer;
+  }
+  .src button { flex: 1; }
+  .src button.active { color: var(--text); border-color: var(--accent2); }
+  .small-btn:hover { color: var(--text); }
+  .small-btn:disabled { opacity: .45; cursor: default; }
+  .remember { display: flex; align-items: center; gap: 6px; color: var(--muted);
+    font-size: 12.5px; margin: 8px 0 0; }
+  .remember input { margin: 0; }
+  .tree-bar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+  .tree-bar .count { margin-left: auto; color: var(--muted); font-size: 12.5px; }
+  #tree {
+    margin-top: 8px; max-height: 360px; overflow-y: auto; border: 1px solid var(--line);
+    border-radius: 10px; background: #0b0d11; padding: 6px 4px; display: none;
+  }
+  #tree details { margin-left: 14px; }
+  #tree > details, #tree > .vid { margin-left: 2px; }
+  #tree summary { cursor: pointer; padding: 3px 4px; color: var(--text); list-style: none; }
+  #tree summary::before { content: "▸"; display: inline-block; width: 14px; color: var(--muted); }
+  #tree details[open] > summary::before { content: "▾"; }
+  #tree summary .n { color: var(--muted); font-size: 12px; margin-left: 4px; }
+  #tree .vid { display: flex; align-items: center; gap: 6px; padding: 3px 4px 3px 32px;
+    color: #c9d1dd; font-size: 13px; }
+  #tree details > .vid { padding-left: 18px; }
+  #tree .vid.off { color: var(--muted); }
+  #tree .vid .note { color: var(--warn); font-size: 11.5px; }
+  #tree .vid .size { color: var(--muted); font-size: 11.5px; margin-left: auto; }
+  #tree input[type=checkbox] { accent-color: var(--accent); }
+  .now { color: var(--muted); font-size: 12.5px; margin-top: 8px; min-height: 18px; }
   footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 18px; }
 </style>
 </head>
@@ -352,7 +476,7 @@ INDEX_HTML = """<!doctype html>
     <div class="logo">💃</div>
     <div>
       <h1>Dance Dub</h1>
-      <div class="sub">Download a Wix video or pick a file — get it transcribed, translated &amp; subtitled.</div>
+      <div class="sub">Download Wix videos or pick a file — get them transcribed, translated &amp; subtitled.</div>
     </div>
     <button class="quit" onclick="quitApp()" title="Stop Dance Dub running in the background">Quit</button>
   </header>
@@ -362,12 +486,43 @@ INDEX_HTML = """<!doctype html>
   <div class="card">
     <div class="modes">
       <button id="m-url" class="active" onclick="setMode('url')">🔗&nbsp; From a Wix URL</button>
+      <button id="m-wix" onclick="setMode('wix')">🔑&nbsp; From my Wix site</button>
       <button id="m-file" onclick="setMode('file')">📁&nbsp; From a file on this PC</button>
     </div>
 
     <div id="url-pane">
       <label>Video page or file URL</label>
       <input type="url" id="url" placeholder="https://your-site.wixsite.com/mysite/video-page" spellcheck="false">
+    </div>
+
+    <div id="wix-pane" style="display:none">
+      <div class="row">
+        <div>
+          <label>Wix API key</label>
+          <input type="password" id="wixKey" spellcheck="false" autocomplete="off" placeholder="Paste your API key">
+        </div>
+        <div>
+          <label>Site ID</label>
+          <input type="text" id="wixSite" spellcheck="false" placeholder="Site ID or your dashboard URL">
+        </div>
+      </div>
+      <div class="hint">
+        Create a key at <a href="https://manage.wix.com/account/api-keys" target="_blank" rel="noopener">Wix API Keys</a>
+        with the Media Manager and Online Programs permissions. The site ID is the long code after
+        <code>/dashboard/</code> in your site's dashboard address; pasting that address works too.
+      </div>
+      <label class="remember"><input type="checkbox" id="wixRemember" checked> Remember on this computer</label>
+      <div class="src">
+        <button id="src-media" class="active" onclick="setSource('media')">🎞&nbsp; Media library</button>
+        <button id="src-programs" onclick="setSource('programs')">🎓&nbsp; Online Programs</button>
+      </div>
+      <div class="tree-bar">
+        <button class="small-btn" id="wixLoad" onclick="loadWix()">Load videos</button>
+        <button class="small-btn" onclick="tickAll(true)">Select all</button>
+        <button class="small-btn" onclick="tickAll(false)">Select none</button>
+        <span class="count" id="wixCount"></span>
+      </div>
+      <div id="tree"></div>
     </div>
 
     <div id="file-pane" style="display:none">
@@ -409,7 +564,8 @@ INDEX_HTML = """<!doctype html>
 
     <button class="go" id="go" onclick="start()">✨&nbsp; Start</button>
 
-    <div class="stages" style="margin-top:14px">
+    <div class="now" id="now"></div>
+    <div class="stages" style="margin-top:6px">
       <div class="stage" id="st-download"><span class="n">⬇</span>Download</div>
       <div class="stage" id="st-extract"><span class="n">🎧</span>Audio</div>
       <div class="stage" id="st-transcribe"><span class="n">✍️</span>Transcribe</div>
@@ -441,10 +597,146 @@ init();
 
 function setMode(m) {
   MODE = m;
-  document.getElementById('m-url').classList.toggle('active', m === 'url');
-  document.getElementById('m-file').classList.toggle('active', m === 'file');
-  document.getElementById('url-pane').style.display = m === 'url' ? '' : 'none';
-  document.getElementById('file-pane').style.display = m === 'file' ? '' : 'none';
+  ['url', 'wix', 'file'].forEach(k => {
+    document.getElementById('m-' + k).classList.toggle('active', m === k);
+    document.getElementById(k + '-pane').style.display = m === k ? '' : 'none';
+  });
+}
+
+// --- Wix site (API) -------------------------------------------------------
+let SOURCE = 'media', WIX_ITEMS = [];
+const LS_KEY = 'dancedub.wix';
+
+function lsGet() { try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}'); } catch (e) { return {}; } }
+function lsSet(v) { try { localStorage.setItem(LS_KEY, JSON.stringify(v)); } catch (e) {} }
+(function restoreWix() {
+  const saved = lsGet();
+  if (saved.key) document.getElementById('wixKey').value = saved.key;
+  if (saved.site) document.getElementById('wixSite').value = saved.site;
+})();
+function wixCreds() {
+  const key = document.getElementById('wixKey').value.trim();
+  const site = document.getElementById('wixSite').value.trim();
+  if (document.getElementById('wixRemember').checked) lsSet({ key, site });
+  else lsSet({});
+  return { api_key: key, site_id: site };
+}
+
+function setSource(s) {
+  SOURCE = s;
+  document.getElementById('src-media').classList.toggle('active', s === 'media');
+  document.getElementById('src-programs').classList.toggle('active', s === 'programs');
+  WIX_ITEMS = [];
+  renderTree();
+}
+
+async function loadWix() {
+  const creds = wixCreds();
+  if (!creds.api_key) return banner('err', 'Paste your Wix API key first.');
+  if (!creds.site_id) return banner('err', 'Enter your Wix site ID first.');
+  const btn = document.getElementById('wixLoad');
+  btn.disabled = true; btn.textContent = 'Loading…';
+  banner('', '');
+  try {
+    const r = await fetch('/api/wix/list', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ source: SOURCE }, creds))
+    });
+    const j = await r.json();
+    if (!j.ok) { WIX_ITEMS = []; banner('err', j.message || 'Could not load videos.'); }
+    else {
+      WIX_ITEMS = j.items;
+      if (!WIX_ITEMS.length) banner('err', SOURCE === 'media'
+        ? 'No videos found in the Media library.' : 'No video steps found in your Online Programs.');
+    }
+  } catch (e) { banner('err', 'Could not load videos: ' + e); }
+  btn.disabled = false; btn.textContent = 'Reload videos';
+  renderTree();
+}
+
+function fmtSize(n) {
+  if (!n) return '';
+  return n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(n / 1e6)) + ' MB';
+}
+
+function renderTree() {
+  const tree = document.getElementById('tree');
+  tree.innerHTML = '';
+  tree.style.display = WIX_ITEMS.length ? 'block' : 'none';
+  // Build nested folders from each item's path.
+  const root = { dirs: new Map(), vids: [] };
+  WIX_ITEMS.forEach(it => {
+    let node = root;
+    it.path.forEach(p => {
+      if (!node.dirs.has(p)) node.dirs.set(p, { dirs: new Map(), vids: [] });
+      node = node.dirs.get(p);
+    });
+    node.vids.push(it);
+  });
+  const countVids = n => n.vids.length + [...n.dirs.values()].reduce((a, d) => a + countVids(d), 0);
+  function build(node, parent, depth) {
+    node.dirs.forEach((child, name) => {
+      const det = document.createElement('details');
+      if (depth < 2) det.open = true;
+      const sum = document.createElement('summary');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.className = 'grp';
+      cb.onclick = e => {
+        e.stopPropagation();
+        det.querySelectorAll('input.vid-cb:not(:disabled)').forEach(x => x.checked = cb.checked);
+        syncGroups();
+      };
+      sum.appendChild(cb);
+      sum.appendChild(document.createTextNode(' 📂 ' + name));
+      const n = document.createElement('span'); n.className = 'n';
+      n.textContent = '(' + countVids(child) + ')';
+      sum.appendChild(n);
+      det.appendChild(sum);
+      build(child, det, depth + 1);
+      parent.appendChild(det);
+    });
+    node.vids.forEach(it => {
+      const row = document.createElement('label');
+      row.className = 'vid' + (it.downloadable ? '' : ' off');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.className = 'vid-cb'; cb.value = it.id;
+      cb.disabled = !it.downloadable; cb.onchange = syncGroups;
+      row.appendChild(cb);
+      row.appendChild(document.createTextNode('🎬 ' + it.title));
+      if (it.note) {
+        const note = document.createElement('span'); note.className = 'note';
+        note.textContent = '— ' + it.note; row.appendChild(note);
+      }
+      const size = document.createElement('span'); size.className = 'size';
+      size.textContent = fmtSize(it.size); row.appendChild(size);
+      parent.appendChild(row);
+    });
+  }
+  build(root, tree, 0);
+  syncGroups();
+}
+
+function syncGroups() {
+  document.querySelectorAll('#tree details').forEach(det => {
+    const boxes = [...det.querySelectorAll('input.vid-cb:not(:disabled)')];
+    const on = boxes.filter(b => b.checked).length;
+    const g = det.querySelector(':scope > summary > input.grp');
+    g.checked = boxes.length > 0 && on === boxes.length;
+    g.indeterminate = on > 0 && on < boxes.length;
+    g.disabled = boxes.length === 0;
+  });
+  const total = WIX_ITEMS.length, picked = selectedIds().length;
+  document.getElementById('wixCount').textContent =
+    total ? picked + ' of ' + total + ' selected' : '';
+}
+
+function selectedIds() {
+  return [...document.querySelectorAll('#tree input.vid-cb:checked')].map(b => b.value);
+}
+
+function tickAll(on) {
+  document.querySelectorAll('#tree input.vid-cb:not(:disabled)').forEach(b => b.checked = on);
+  syncGroups();
 }
 
 const drop = document.getElementById('drop'), fi = document.getElementById('fileInput');
@@ -499,6 +791,10 @@ async function start() {
     const url = document.getElementById('url').value.trim();
     if (!url) return banner('err', 'Paste a video URL first.');
     body = { mode: 'url', url };
+  } else if (MODE === 'wix') {
+    const ids = selectedIds();
+    if (!ids.length) return banner('err', 'Load your videos and tick the ones you want.');
+    body = Object.assign({ mode: 'wix', ids }, wixCreds());
   } else {
     if (!PICKED || !PICKED.path) return banner('err', 'Choose or drop a video file first.');
     body = { mode: 'file', path: PICKED.path };
@@ -535,6 +831,9 @@ async function poll() {
   log.textContent = j.log.length ? j.log.join('\\n') : 'Waiting…';
   log.scrollTop = log.scrollHeight;
 
+  document.getElementById('now').textContent =
+    st.running && st.item ? 'Now: ' + st.item : '';
+
   const order = ['download','extract','transcribe','translate','burn'];
   const doneIdx = order.indexOf(st.stages_done ? st.stages_done[st.stages_done.length-1] : null);
   order.forEach((s, i) => {
@@ -548,7 +847,7 @@ async function poll() {
     document.getElementById('go').disabled = false;
     if (st.error) banner('err', st.error);
     else if (st.done) {
-      const dir = st.result ? st.result.replace(/[\\\\/][^\\\\/]+$/, '') : '';
+      const dir = st.folder ? st.folder : st.result ? st.result.replace(/[\\\\/][^\\\\/]+$/, '') : '';
       banner('ok', '✔ Done! ' + st.result, dir);
     }
   }
