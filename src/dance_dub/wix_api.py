@@ -83,6 +83,44 @@ def best_video_url(video: Optional[dict]) -> str:
     return max(mp4s, key=lambda r: int(r.get("height") or 0))["url"]
 
 
+_LINK_RES = [
+    re.compile(r"https?://video\.wixstatic\.com/video/[^\s\"'<>]+?\.mp4", re.I),
+    re.compile(r"https?://[\w.-]*wixmp\.com/[^\s\"'<>]+?\.m3u8[^\s\"'<>]*", re.I),
+]
+_WV_ITEM_TAG = "_wv_itemId_"
+
+
+def _wix_video_item_id(file_descriptor: dict) -> str:
+    """Wix Video app item a Media Manager file belongs to, from the
+    `_wv_itemId_<id>` internal tag Wix puts on files uploaded through it."""
+    for tag in file_descriptor.get("internalTags") or []:
+        if isinstance(tag, str) and tag.startswith(_WV_ITEM_TAG):
+            return tag[len(_WV_ITEM_TAG):].lower()
+    return ""
+
+
+def _strings(obj) -> Iterator[str]:
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+
+
+def find_video_link(obj) -> str:
+    """First direct video link anywhere in an API object (MP4, then HLS)."""
+    texts = list(_strings(obj))
+    for rx in _LINK_RES:
+        for t in texts:
+            m = rx.search(t)
+            if m:
+                return m.group(0)
+    return ""
+
+
 def _match_key(title: str) -> str:
     """Loose title key: case, extension, punctuation and spacing ignored."""
     title = re.sub(r"\.(mp4|mov|m4v|webm|mkv|avi)$", "", (title or "").strip(), flags=re.I)
@@ -191,6 +229,7 @@ class WixClient:
                     size=int(f.get("sizeInBytes") or 0),
                     downloadable=ready,
                     note="" if ready else "Still processing in Wix",
+                    extra={"wix_video_item": _wix_video_item_id(f)},
                 ))
             for sub in self._paged_get(
                 "/site-media/v1/folders", "folders",
@@ -243,6 +282,7 @@ class WixClient:
                             ) -> List[VideoItem]:
         """Every video step of every program: Program / NN Section / NN Step."""
         items: List[VideoItem] = []
+        self.raw_steps: Dict[str, dict] = {}
         log("[wix] listing Online Programs")
         programs = list(self._query(
             "/online-programs/v3/programs/query", "programs",
@@ -307,27 +347,55 @@ class WixClient:
                         item.note = "Wix Video app video; the API gives no file link"
                         item.extra.update(wix_video_id=opts["wixVideo"].get("id"),
                                           step_title=title)
+                        self.raw_steps[item.id] = step
                     else:
                         item.downloadable, item.note = False, "No video attached"
                     items.append(item)
-        self._match_wix_video_steps(items, log)
+        self._resolve_wix_video_steps(items, log)
         return items
 
-    def _match_wix_video_steps(self, items: List[VideoItem],
-                               log: Callable[[str], None]) -> None:
-        """Wix has no public API for the Wix Video app's library, so a step
-        that points at it has no file link. When the same video is also in
-        the Media Manager under the same name, use that file instead."""
+    def _resolve_wix_video_steps(self, items: List[VideoItem],
+                                 log: Callable[[str], None]) -> None:
+        """Wix publishes no API for the Wix Video app's library, so these
+        steps carry only a Wix Video item ID. Files uploaded through Wix Video
+        also live in the Media Manager, tagged with that item ID, so match on
+        the tag; then fall back to a link in the step data, then a name match."""
         pending = [it for it in items if it.extra.get("wix_video_id")]
         if not pending:
             return
         log(f"[wix] {len(pending)} step(s) use Wix Video app videos; "
-            "looking for the same videos in the Media Manager")
+            "looking them up in the Media Manager")
         try:
             media = self.list_media_videos()
         except WixApiError as exc:
             log(f"[wix] could not read the Media Manager: {exc}")
+            media = []
+        self._media_cache = media
+        by_item = {m.extra["wix_video_item"]: m for m in media
+                   if m.downloadable and m.extra.get("wix_video_item")}
+        for it in pending:
+            m = by_item.get(str(it.extra["wix_video_id"]).lower())
+            if m:
+                it.url, it.file_id, it.size = m.url, m.file_id, m.size
+                it.downloadable = True
+                it.note = f"Wix Video app video, found in the Media library as {m.title}"
+                continue
+            link = find_video_link(self.raw_steps.get(it.id) or {})
+            if link:
+                it.url, it.downloadable = link, True
+                it.extra["needs_ytdlp"] = link.lower().split("?")[0].endswith(".m3u8")
+                it.note = "Wix Video app video, link found in the step data"
+        self._match_wix_video_steps(items, log)
+
+    def _match_wix_video_steps(self, items: List[VideoItem],
+                               log: Callable[[str], None]) -> None:
+        """Last resort for steps still without a file: a Media Manager video
+        with the same name as the step, when exactly one has it."""
+        pending = [it for it in items
+                   if it.extra.get("wix_video_id") and not it.downloadable]
+        if not pending:
             return
+        media = getattr(self, "_media_cache", None) or []
         by_key: Dict[str, List[VideoItem]] = {}
         for m in media:
             if m.downloadable:
@@ -344,5 +412,5 @@ class WixClient:
                 it.note = ("Wix Video app video; several Media library files "
                            "share its name, so none was picked")
             else:
-                it.note = ("Wix Video app video; the API gives no file link and "
-                           "no Media library file has the same name")
+                it.note = ("Wix Video app video; Wix gives no file link. "
+                           "Paste the video's link to include it")

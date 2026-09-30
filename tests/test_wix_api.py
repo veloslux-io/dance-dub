@@ -47,6 +47,7 @@ class FakeWix:
             ],
         }
         self.grant_original = True
+        self.extra_step_fields = {}  # step ID -> fields merged into its step
 
     def __call__(self, method, url, headers, body):
         assert headers["Authorization"] == "KEY"
@@ -79,7 +80,7 @@ class FakeWix:
             ]}
         if path == "/online-programs/v3/steps/query":
             assert payload["query"]["filter"] == {"programId": {"$eq": "p1"}}
-            return {"steps": [
+            return {"steps": [dict(st, **self.extra_step_fields.get(st["id"], {})) for st in [
                 {"id": "s3", "sectionId": "sec2", "ordering": 10, "stepType": "VIDEO",
                  "description": {"title": "Footwork"},
                  "videoOptions": {"video": {"id": "m3", **_video([(720, "https://v/s3.mp4")])}}},
@@ -91,7 +92,7 @@ class FakeWix:
                 {"id": "s4", "sectionId": "sec1", "ordering": 30, "stepType": "VIDEO",
                  "description": {"title": "Guest class"},
                  "videoOptions": {"wixVideo": {"id": "wv1"}}},
-            ]}
+            ]]}
         if path.startswith("/online-programs/v3/sections/"):
             sid = path.rsplit("/", 1)[-1]
             return {"section": {
@@ -261,3 +262,58 @@ def test_steps_query_asks_for_extended_fields(client, fake):
     client.list_program_videos()
     steps_call = next(c for c in fake.calls if c[1] == "/online-programs/v3/steps/query")
     assert steps_call[3]["descriptionFieldSet"] == "EXTENDED"
+
+
+def _guest(client):
+    return next(it for it in client.list_program_videos() if "Guest" in it.title)
+
+
+def test_wix_video_step_found_by_media_manager_tag(client, fake):
+    # Files uploaded through Wix Video carry a _wv_itemId_<item id> tag.
+    fake.files["f-classes"] = [{
+        "id": "ed6f86_acd.mp4", "displayName": "217490.mp4", "state": "OK",
+        "operationStatus": "READY", "sizeInBytes": "9008932",
+        "internalTags": ["_wv_itemId_WV1", "_wv_videoContent"],
+        "media": {"video": _video([(1080, "https://v/217490-1080.mp4")])},
+    }]
+    guest = _guest(client)
+    assert guest.downloadable is True
+    assert guest.url == "https://v/217490-1080.mp4" and guest.file_id == "ed6f86_acd.mp4"
+    assert guest.size == 9008932 and "217490.mp4" in guest.note
+    assert guest.path == ["Bachata 101", "01 Week 1"]
+
+
+def test_wix_video_link_found_in_step_data(client, fake):
+    fake.extra_step_fields["s4"] = {"description": {"title": "Guest class", "details":
+        '{"src":"https://repackager.wixmp.com/video.wixstatic.com/video/ab_1/,720p,/mp4/file.mp4.urlset/master.m3u8"}'}}
+    guest = _guest(client)
+    assert guest.downloadable is True
+    assert guest.url.endswith("master.m3u8") and guest.extra["needs_ytdlp"] is True
+
+
+def test_unresolved_steps_offer_paste_and_save_debug(client, fake, monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "APP_DIR", tmp_path)
+    monkeypatch.setattr(W, "_urllib_transport", fake)
+    out = A.handle_wix_list({"api_key": "KEY", "site_id": SITE, "source": "programs"})
+    guest = next(i for i in out["items"] if "Guest" in i["title"])
+    assert guest["downloadable"] is False and "Paste" in guest["note"]
+    saved = json.loads(Path(out["debug_file"]).read_text())
+    assert list(saved) == [guest["id"]]
+
+
+def test_pasted_link_is_used_with_ytdlp(client, fake, monkeypatch, tmp_path):
+    monkeypatch.setattr(W, "_urllib_transport", fake)
+    A.handle_wix_list({"api_key": "KEY", "site_id": SITE, "source": "programs"})
+    guest = next(i for i, it in A.WIX_ITEMS.items() if "Guest" in it.title)
+    started = {}
+    monkeypatch.setattr(A.JM, "start", lambda kind, label, runner: started.update(r=runner) or True)
+    ok, msg = A.handle_start({"mode": "wix", "ids": [guest], "api_key": "KEY",
+                              "site_id": SITE, "output": str(tmp_path),
+                              "links": {guest: " https://site.com/v.m3u8 "}})
+    assert ok, msg
+    seen = []
+    monkeypatch.setattr(P, "download_video", lambda url, wd, log=None: seen.append(url))
+    monkeypatch.setattr(P, "download_file_url", lambda *a, **k: pytest.fail("wrong downloader"))
+    monkeypatch.setattr(P, "run_pipeline", lambda wd, **kw: wd / "final.mp4")
+    started["r"](lambda m: None)
+    assert seen == ["https://site.com/v.m3u8"]
