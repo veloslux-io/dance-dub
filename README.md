@@ -22,7 +22,12 @@ Lists every video on your own Wix site so you can tick the ones you want and pro
 3. Pick a source and press **Load videos**:
    - **Media library**: every video in the Media Manager, grouped by its Media Manager folders.
    - **Online Programs**: every video step, grouped as program, then numbered sections and steps in the program's order.
-4. Tick videos (a folder's box ticks everything in it) and press **Start**. Each video is downloaded, then transcribed, translated and subtitled; one failure doesn't stop the rest.
+4. Each video has two boxes and a badge:
+   - **⬇ Download** fetches just the video file. It shows ticked and greyed when the video is already in the **Save to** folder.
+   - **✨ Process** downloads the video if needed, then runs audio, transcription, translation and subtitles.
+   - The badge (**Not downloaded**, **✓ Downloaded**, **✓ Subtitled**) is read from the Save to folder, so deleting a video file there turns it back to Not downloaded. The list re-checks when you return to the window, change the folder, finish a job, or press **↻ Check folder**.
+
+   A folder's boxes tick everything inside it. Press **Start**; one failure doesn't stop the rest.
 
 Output mirrors the listing, e.g. `Videos\Bachata 101\01 Week 1\01 Welcome\final_01 Welcome.mp4`. Program steps that use a video from the separate Wix Video app get no file link from Wix's API. Dance Dub finds those videos in the Media Manager instead, where Wix tags each Wix Video upload with its video ID, and the list shows which file it used. If a step still has no file, press **Paste link** next to it and paste the video's address: open the step on your live site, press F12, go to the Network tab, play the video, filter for `wixstatic` or `m3u8`, and copy that request's URL. When steps stay unresolved, what Wix returned for them is saved to `DanceDub\wix-video-steps.json` (it contains no key). "Remember on this computer" keeps the key in this browser's storage on your PC.
 
