@@ -366,3 +366,42 @@ def test_run_all_order(tmp_path, monkeypatch):
     out = P.run_all("https://s.wixsite.com/d/videos/my-dance", tmp_path)
     assert calls == ["download", "extract", "transcribe", "translate", "burn"]
     assert out == tmp_path / "my-dance" / "final_my-dance.mp4"
+
+
+# --- WebVTT ------------------------------------------------------------------
+
+def test_srt_to_vtt():
+    srt = ("1\n00:00:01,000 --> 00:00:02,500\nHello <b> & --> bye\n\n"
+           "2\n01:00:03,5 --> 01:00:04,000\nTwo\n")
+    assert P.srt_to_vtt(srt) == (
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.500\nHello &lt;b> &amp; --&gt; bye\n\n"
+        "01:00:03.500 --> 01:00:04.000\nTwo\n"
+    )
+    assert P.srt_to_vtt("") == "WEBVTT\n"
+
+
+def test_write_vtt_refreshes_when_srt_is_newer(tmp_path):
+    import os
+    srt = tmp_path / "transcript.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nOld\n", encoding="utf-8")
+    vtt = P.write_vtt(srt)
+    assert vtt.name == "transcript.vtt" and "Old" in vtt.read_text(encoding="utf-8")
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nNew\n", encoding="utf-8")
+    later = vtt.stat().st_mtime + 5
+    os.utime(srt, (later, later))
+    assert "New" in P.write_vtt(srt).read_text(encoding="utf-8")
+
+
+def test_translate_writes_vtt(tmp_path):
+    srt = tmp_path / "transcript.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHola\n", encoding="utf-8")
+
+    class T:
+        def translate(self, text):
+            return text.replace("Hola", "Hello")
+
+    P.translate_srt_file(srt, "en", source_lang="es", log=lambda m: None,
+                         translator_factory=lambda s, t: T())
+    vtt = (tmp_path / "transcript_translated.vtt").read_text(encoding="utf-8")
+    assert vtt.startswith("WEBVTT") and "Hello" in vtt

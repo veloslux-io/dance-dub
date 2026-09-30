@@ -115,6 +115,32 @@ def write_srt(blocks: Sequence[Tuple[str, str, str]]) -> str:
     return "\n".join(out)
 
 
+def srt_to_vtt(srt_text: str) -> str:
+    """Convert SRT to WebVTT (what web players such as Wix's take as captions)."""
+    out = ["WEBVTT", ""]
+    for _, timespan, text in parse_srt(srt_text):
+        t = _SRT_TIME_RE.search(timespan)
+        if not t or not text.strip():
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = t.groups()
+        out.append(f"{int(h1):02d}:{m1}:{s1}.{ms1.ljust(3, '0')} --> "
+                   f"{int(h2):02d}:{m2}:{s2}.{ms2.ljust(3, '0')}")
+        # "-->" may not appear in cue text, and & and < start markup.
+        out.append(text.strip().replace("&", "&amp;").replace("<", "&lt;")
+                   .replace("-->", "--&gt;"))
+        out.append("")
+    return "\n".join(out)
+
+
+def write_vtt(srt_path: Path) -> Path:
+    """Write <name>.vtt next to an SRT file, refreshing it if the SRT is newer."""
+    vtt = srt_path.with_suffix(".vtt")
+    if not vtt.exists() or vtt.stat().st_mtime < srt_path.stat().st_mtime:
+        vtt.write_text(srt_to_vtt(srt_path.read_text(encoding="utf-8")),
+                       encoding="utf-8")
+    return vtt
+
+
 # --- ffmpeg command builders -------------------------------------------------
 
 def ffmpeg_exe() -> str:
@@ -457,6 +483,7 @@ def transcribe_audio(
     txt = workdir / "transcript.txt"
     if srt.exists() and not force:
         log("[transcribe] transcript.srt exists, skipping")
+        write_vtt(srt)
         return srt
 
     cpu_fallback = None
@@ -495,7 +522,8 @@ def transcribe_audio(
     )
     log(f"[transcribe] detected language: {info.language} "
         f"(p={info.language_probability:.2f})")
-    log(f"[transcribe] wrote {srt.name} and {txt.name}")
+    vtt = write_vtt(srt)
+    log(f"[transcribe] wrote {srt.name}, {vtt.name} and {txt.name}")
     return srt
 
 
@@ -606,6 +634,7 @@ def translate_srt_file(
     out_path = srt_path.with_name(srt_path.stem + "_translated.srt")
     if out_path.exists() and not force:
         log(f"[translate] {out_path.name} exists, skipping")
+        write_vtt(out_path)
         return out_path
     if not srt_path.exists():
         raise FileNotFoundError(f"{srt_path} not found — run transcribe first.")
@@ -617,6 +646,7 @@ def translate_srt_file(
     if not blocks:
         log("[translate] nothing to translate (empty transcript)")
         out_path.write_text("", encoding="utf-8")
+        write_vtt(out_path)
         return out_path
 
     # Use the language Whisper detected rather than "auto": the fallback
@@ -627,6 +657,7 @@ def translate_srt_file(
     if source_lang.split("-")[0].lower() == target_lang.split("-")[0].lower():
         log(f"[translate] already in {target_lang}, keeping the original text")
         out_path.write_text(write_srt(blocks), encoding="utf-8")
+        write_vtt(out_path)
         return out_path
 
     translator = translator_factory(source_lang, target_lang)
@@ -695,7 +726,8 @@ def translate_srt_file(
         (blocks[i][0], blocks[i][1], translated[i]) for i in range(len(blocks))
     ]
     out_path.write_text(write_srt(out_blocks), encoding="utf-8")
-    log(f"[translate] wrote {out_path.name}")
+    vtt = write_vtt(out_path)
+    log(f"[translate] wrote {out_path.name} and {vtt.name}")
     return out_path
 
 
