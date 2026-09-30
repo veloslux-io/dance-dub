@@ -83,6 +83,12 @@ def best_video_url(video: Optional[dict]) -> str:
     return max(mp4s, key=lambda r: int(r.get("height") or 0))["url"]
 
 
+def _match_key(title: str) -> str:
+    """Loose title key: case, extension, punctuation and spacing ignored."""
+    title = re.sub(r"\.(mp4|mov|m4v|webm|mkv|avi)$", "", (title or "").strip(), flags=re.I)
+    return re.sub(r"[\W_]+", " ", title).strip().lower()
+
+
 def _numbered(i: int, total: int, title: str) -> str:
     width = max(2, len(str(total)))
     return f"{i:0{width}d} {safe_name(title)}"
@@ -254,7 +260,7 @@ class WixClient:
                 {"filter": {"programId": {"$eq": pid}},
                  "sort": [{"fieldName": "ordering", "order": "ASC"}]},
                 limit=500,
-                extra={"programId": pid},
+                extra={"programId": pid, "descriptionFieldSet": "EXTENDED"},
             ))
             sections: Dict[str, dict] = {}
             for sid in dict.fromkeys(s.get("sectionId") for s in steps):
@@ -299,7 +305,44 @@ class WixClient:
                     elif opts.get("wixVideo"):
                         item.downloadable = False
                         item.note = "Wix Video app video; the API gives no file link"
+                        item.extra.update(wix_video_id=opts["wixVideo"].get("id"),
+                                          step_title=title)
                     else:
                         item.downloadable, item.note = False, "No video attached"
                     items.append(item)
+        self._match_wix_video_steps(items, log)
         return items
+
+    def _match_wix_video_steps(self, items: List[VideoItem],
+                               log: Callable[[str], None]) -> None:
+        """Wix has no public API for the Wix Video app's library, so a step
+        that points at it has no file link. When the same video is also in
+        the Media Manager under the same name, use that file instead."""
+        pending = [it for it in items if it.extra.get("wix_video_id")]
+        if not pending:
+            return
+        log(f"[wix] {len(pending)} step(s) use Wix Video app videos; "
+            "looking for the same videos in the Media Manager")
+        try:
+            media = self.list_media_videos()
+        except WixApiError as exc:
+            log(f"[wix] could not read the Media Manager: {exc}")
+            return
+        by_key: Dict[str, List[VideoItem]] = {}
+        for m in media:
+            if m.downloadable:
+                by_key.setdefault(_match_key(m.title), []).append(m)
+        for it in pending:
+            matches = by_key.get(_match_key(it.extra["step_title"])) or []
+            if len(matches) == 1:
+                m = matches[0]
+                it.url, it.file_id, it.size = m.url, m.file_id, m.size
+                it.downloadable = True
+                where = "/".join(m.path + [m.title])
+                it.note = f"Wix Video app video, matched by name to Media library: {where}"
+            elif len(matches) > 1:
+                it.note = ("Wix Video app video; several Media library files "
+                           "share its name, so none was picked")
+            else:
+                it.note = ("Wix Video app video; the API gives no file link and "
+                           "no Media library file has the same name")

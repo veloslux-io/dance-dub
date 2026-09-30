@@ -24,7 +24,7 @@ Lists every video on your own Wix site so you can tick the ones you want and pro
    - **Online Programs**: every video step, grouped as program, then numbered sections and steps in the program's order.
 4. Tick videos (a folder's box ticks everything in it) and press **Start**. Each video is downloaded, then transcribed, translated and subtitled; one failure doesn't stop the rest.
 
-Output mirrors the listing, e.g. `Videos\Bachata 101\01 Week 1\01 Welcome\final_01 Welcome.mp4`. Videos added to a program from the separate Wix Video app show up greyed out: the API gives no file link for those. "Remember on this computer" keeps the key in this browser's storage on your PC.
+Output mirrors the listing, e.g. `Videos\Bachata 101\01 Week 1\01 Welcome\final_01 Welcome.mp4`. Wix has no public API for the separate Wix Video app's library, so a program step that uses a Wix Video app video has no file link. Dance Dub then looks in your Media library for a video with the same name and uses it (the list shows which file it matched); if there is no single match the step stays greyed out. To make one downloadable, upload the same file to the Media Manager with the step's name, or switch the step to a Media Manager video. "Remember on this computer" keeps the key in this browser's storage on your PC.
 
 ## macOS / Linux (from source)
 

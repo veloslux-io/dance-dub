@@ -234,3 +234,30 @@ def test_download_file_url_rejects_tiny_files(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         P.download_file_url("https://x/v.mp4", tmp_path, log=lambda m: None)
     assert not (tmp_path / "video.mp4").exists()
+
+
+def test_wix_video_step_matched_to_media_file_by_name(client, fake):
+    fake.files["f-classes"] = [{
+        "id": "guest.mp4", "displayName": "Guest_Class.MP4", "state": "OK",
+        "operationStatus": "READY", "media": {"video": _video([(720, "https://v/g.mp4")])},
+    }]
+    guest = next(it for it in client.list_program_videos() if "Guest" in it.title)
+    assert guest.downloadable is True
+    assert guest.url == "https://v/g.mp4" and guest.file_id == "guest.mp4"
+    assert "Classes/Guest_Class.MP4" in guest.note
+    assert guest.path == ["Bachata 101", "01 Week 1"]  # keeps the program's structure
+
+
+def test_wix_video_step_not_matched_when_name_is_ambiguous(client, fake):
+    dup = {"state": "OK", "operationStatus": "READY",
+           "media": {"video": _video([(720, "https://v/x.mp4")])}}
+    fake.files["f-classes"] = [dict(dup, id="1.mp4", displayName="guest class.mp4"),
+                               dict(dup, id="2.mov", displayName="Guest class.mov")]
+    guest = next(it for it in client.list_program_videos() if "Guest" in it.title)
+    assert guest.downloadable is False and "several" in guest.note
+
+
+def test_steps_query_asks_for_extended_fields(client, fake):
+    client.list_program_videos()
+    steps_call = next(c for c in fake.calls if c[1] == "/online-programs/v3/steps/query")
+    assert steps_call[3]["descriptionFieldSet"] == "EXTENDED"
