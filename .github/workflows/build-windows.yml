@@ -5,6 +5,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# The repo's default workflow token is read-only; creating the GitHub Release
+# and attaching the zip on a tag needs write access to contents.
+permissions:
+  contents: write
+
 # Runs on a self-hosted Windows runner (see README "Building the Windows app").
 # To use GitHub's cloud runner instead, change the line below to:
 #   runs-on: windows-latest
@@ -144,3 +149,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: DanceDub-windows.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
