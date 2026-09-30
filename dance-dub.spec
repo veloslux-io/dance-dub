@@ -10,6 +10,7 @@ binaries = []
 hiddenimports = [
     "dance_dub",
     "dance_dub.pipeline",
+    "dance_dub.wix_api",
     "dance_dub.app",
     "dance_dub.cli",
 ]

@@ -323,6 +323,32 @@ def _wix_scrape_fallback(page_url: str, workdir: Path, log: LogFn) -> None:
             log(f"[download] candidate failed: {exc}")
 
 
+def download_file_url(
+    url: str,
+    workdir: Path,
+    log: LogFn = default_log,
+    force: bool = False,
+) -> Path:
+    """Download a known direct video link (e.g. from the Wix API) as video.mp4."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    existing = find_video(workdir)
+    if existing and not force:
+        log(f"[download] already exists, skipping: {existing.name}")
+        return existing
+    if not url:
+        raise RuntimeError("Wix gave no download link for this video.")
+    dest = workdir / "video.mp4"
+    part = workdir / "video.mp4.part"
+    log("[download] fetching video from Wix")
+    _download_direct(url, part)
+    if part.stat().st_size <= 10_000:  # an error page, not a video
+        part.unlink(missing_ok=True)
+        raise RuntimeError("Wix returned an empty or invalid video file.")
+    part.replace(dest)
+    log(f"[download] saved {dest.name}")
+    return dest
+
+
 def download_video(
     url: str,
     workdir: Path,
