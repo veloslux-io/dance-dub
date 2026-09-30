@@ -126,8 +126,29 @@ def _open_folder(path: str) -> str:
 WIX_ITEMS: dict[str, W.VideoItem] = {}
 
 
+def _out_root(payload: dict) -> Path:
+    raw = payload.get("output") or (APP_DIR / "Videos")
+    return Path(os.path.expanduser(str(raw)))
+
+
+def wix_disk_state(out_root: Path, item: W.VideoItem) -> dict:
+    """What's already in the output folder for this video, read fresh from
+    disk each time so deleting a file shows up as "not downloaded"."""
+    workdir = wix_workdir(out_root, item)
+    downloaded = P.find_video(workdir) is not None
+    processed = downloaded and (workdir / f"final_{workdir.name}.mp4").exists()
+    return {"downloaded": downloaded, "processed": processed}
+
+
+def handle_wix_state(payload: dict) -> dict:
+    """POST /api/wix/state — {output}: disk state of every listed video."""
+    out_root = _out_root(payload)
+    return {"ok": True, "states": {i: wix_disk_state(out_root, it)
+                                   for i, it in WIX_ITEMS.items()}}
+
+
 def handle_wix_list(payload: dict) -> dict:
-    """POST /api/wix/list — {api_key, site_id, source: media|programs}."""
+    """POST /api/wix/list — {api_key, site_id, source: media|programs, output}."""
     source = payload.get("source") or "media"
     try:
         client = W.WixClient(payload.get("api_key") or "", payload.get("site_id") or "")
@@ -141,7 +162,10 @@ def handle_wix_list(payload: dict) -> dict:
         return {"ok": False, "message": f"Could not list videos: {exc}"}
     WIX_ITEMS.clear()
     WIX_ITEMS.update({it.id: it for it in items})
-    out = {"ok": True, "source": source, "items": [it.to_dict() for it in items]}
+    out_root = _out_root(payload)
+    out = {"ok": True, "source": source,
+           "items": [dict(it.to_dict(), state=wix_disk_state(out_root, it))
+                     for it in items]}
     unresolved = {i: s for i, s in getattr(client, "raw_steps", {}).items()
                   if not WIX_ITEMS[i].downloadable}
     if unresolved:
@@ -168,15 +192,17 @@ def wix_workdir(out_root: Path, item: W.VideoItem) -> Path:
     return out_root.joinpath(*item.path, W.safe_name(name))
 
 
-def run_wix_batch(client: W.WixClient, items: list, out_root: Path,
+def run_wix_batch(client: W.WixClient, jobs: list, out_root: Path,
                   target: str, model: str, log_fn) -> dict:
-    """Download and process each selected video in turn; one failure doesn't
-    stop the rest."""
+    """Work through (item, action) pairs in turn. "download" only fetches the
+    video; "process" also runs audio, transcription, translation and
+    subtitles. One failure doesn't stop the rest."""
     done, failed = [], []
-    total = len(items)
-    for i, item in enumerate(items, start=1):
+    total = len(jobs)
+    for i, (item, action) in enumerate(jobs, start=1):
         workdir = wix_workdir(out_root, item)
-        log_fn(f"[item] {i}/{total} {'/'.join(item.path + [item.title])}")
+        verb = "Process" if action == "process" else "Download"
+        log_fn(f"[item] {i}/{total} {verb}: {'/'.join(item.path + [item.title])}")
         try:
             if item.extra.get("needs_ytdlp") and not P.find_video(workdir):
                 # A pasted link or an HLS stream: yt-dlp (with the page-scrape
@@ -185,9 +211,10 @@ def run_wix_batch(client: W.WixClient, items: list, out_root: Path,
             else:
                 url = "" if P.find_video(workdir) else client.download_url(item)
                 P.download_file_url(url, workdir, log=log_fn)
-            done.append(P.run_pipeline(
-                workdir, target_lang=target, model_size=model, log=log_fn
-            ))
+            if action == "process":
+                P.run_pipeline(workdir, target_lang=target, model_size=model,
+                               log=log_fn)
+            done.append(action)
         except Exception as exc:
             failed.append(item.title)
             log_fn(f"✖ {item.title}: {exc}")
@@ -195,7 +222,12 @@ def run_wix_batch(client: W.WixClient, items: list, out_root: Path,
         raise RuntimeError(
             f"None of the {total} video(s) finished. See the progress log."
         )
-    summary = f"{len(done)} of {total} video(s) subtitled in {out_root}"
+    parts = []
+    if done.count("process"):
+        parts.append(f"{done.count('process')} processed")
+    if done.count("download"):
+        parts.append(f"{done.count('download')} downloaded")
+    summary = f"{len(done)} of {total} done ({', '.join(parts)}) in {out_root}"
     if failed:
         summary += f" — failed: {', '.join(failed)}"
     return {"result": summary, "folder": str(out_root)}
@@ -204,8 +236,7 @@ def run_wix_batch(client: W.WixClient, items: list, out_root: Path,
 def handle_start(payload: dict) -> tuple[bool, str]:
     """POST /api/start — {mode: url|file, ...opts}. Returns (ok, message)."""
     mode = payload.get("mode")
-    out_root = Path(payload.get("output") or (APP_DIR / "Videos"))
-    out_root = Path(os.path.expanduser(str(out_root)))
+    out_root = _out_root(payload)
     model = payload.get("model") or "small"
     target = payload.get("target_lang") or "en"
 
@@ -242,11 +273,13 @@ def handle_start(payload: dict) -> tuple[bool, str]:
         return started, "" if started else "A job is already running."
 
     if mode == "wix":
-        ids = payload.get("ids") or []
-        items = [WIX_ITEMS[i] for i in ids if i in WIX_ITEMS]
+        process_ids = list(dict.fromkeys(payload.get("process_ids") or []))
+        download_ids = [i for i in dict.fromkeys(payload.get("download_ids") or [])
+                        if i not in process_ids]  # processing downloads anyway
+        ids = process_ids + download_ids
         if not ids:
-            return False, "Tick at least one video first."
-        if len(items) != len(ids):
+            return False, "Tick Download or Process on at least one video first."
+        if any(i not in WIX_ITEMS for i in ids):
             return False, "The video list is out of date. Press Load videos again."
         for i, link in (payload.get("links") or {}).items():
             link = (link or "").strip()
@@ -255,9 +288,16 @@ def handle_start(payload: dict) -> tuple[bool, str]:
                 it.url, it.file_id, it.downloadable = link, "", True
                 it.extra["needs_ytdlp"] = True
                 it.note = "Using the link you pasted"
-        items = [it for it in items if it.downloadable]
-        if not items:
-            return False, "None of the ticked videos can be downloaded."
+        jobs = []
+        for i in ids:
+            it = WIX_ITEMS[i]
+            on_disk = wix_disk_state(out_root, it)["downloaded"]
+            if i in process_ids and (it.downloadable or on_disk):
+                jobs.append((it, "process"))
+            elif i in download_ids and it.downloadable and not on_disk:
+                jobs.append((it, "download"))
+        if not jobs:
+            return False, "None of the ticked videos can be downloaded or processed."
         try:
             client = W.WixClient(payload.get("api_key") or "",
                                  payload.get("site_id") or "")
@@ -265,9 +305,9 @@ def handle_start(payload: dict) -> tuple[bool, str]:
             return False, str(exc)
 
         def runner(log_fn):
-            return run_wix_batch(client, items, out_root, target, model, log_fn)
+            return run_wix_batch(client, jobs, out_root, target, model, log_fn)
 
-        label = f"{len(items)} video(s)"
+        label = f"{len(jobs)} video(s)"
         started = JM.start("Wix site", label, runner)
         return started, "" if started else "A job is already running."
 
@@ -318,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/wix/list":
             self._json(handle_wix_list(payload))
+        elif self.path == "/api/wix/state":
+            self._json(handle_wix_state(payload))
         elif self.path == "/api/start":
             ok, msg = handle_start(payload)
             self._json({"ok": ok, "message": msg})
@@ -493,6 +535,17 @@ INDEX_HTML = """<!doctype html>
   #tree details > .vid { padding-left: 18px; }
   #tree .vid.off { color: var(--muted); }
   #tree .vid .note { color: var(--warn); font-size: 11.5px; }
+  #tree .cols { display: flex; gap: 6px; padding: 2px 4px 6px; color: var(--muted);
+    font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+  #tree .cols span { width: 22px; text-align: center; }
+  #tree .cols span.wide { width: auto; }
+  #tree summary input { margin: 0 3px; }
+  #tree .vid input { margin: 0 3px; }
+  #tree .badge { font-size: 11px; border-radius: 6px; padding: 1px 7px; margin-left: 4px;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  #tree .badge.dl { color: var(--accent2); border-color: color-mix(in srgb, var(--accent2) 50%, var(--line)); }
+  #tree .badge.done { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); }
   #tree .vid .link-btn { padding: 2px 8px; font-size: 11.5px; border-radius: 7px; }
   #tree .vid .size { color: var(--muted); font-size: 11.5px; margin-left: auto; }
   #tree input[type=checkbox] { accent-color: var(--accent); }
@@ -548,8 +601,10 @@ INDEX_HTML = """<!doctype html>
       </div>
       <div class="tree-bar">
         <button class="small-btn" id="wixLoad" onclick="loadWix()">Load videos</button>
-        <button class="small-btn" onclick="tickAll(true)">Select all</button>
-        <button class="small-btn" onclick="tickAll(false)">Select none</button>
+        <button class="small-btn" onclick="tickAll('dl')" title="Tick Download on every video not yet in the folder">Download all</button>
+        <button class="small-btn" onclick="tickAll('pr')" title="Tick Process on every video">Process all</button>
+        <button class="small-btn" onclick="tickAll(null)">Clear</button>
+        <button class="small-btn" onclick="refreshStates()" title="Check the Save to folder again">↻ Check folder</button>
         <span class="count" id="wixCount"></span>
       </div>
       <div id="tree"></div>
@@ -670,7 +725,8 @@ async function loadWix() {
   try {
     const r = await fetch('/api/wix/list', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(Object.assign({ source: SOURCE }, creds))
+      body: JSON.stringify(Object.assign(
+        { source: SOURCE, output: document.getElementById('output').value }, creds))
     });
     const j = await r.json();
     if (!j.ok) { WIX_ITEMS = []; banner('err', j.message || 'Could not load videos.'); }
@@ -689,10 +745,19 @@ function fmtSize(n) {
   return n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(n / 1e6)) + ' MB';
 }
 
+function canDownload(it) { return !!(it.downloadable || LINKS[it.id]); }
+function onDisk(it) { return !!(it.state && it.state.downloaded); }
+
 function renderTree() {
   const tree = document.getElementById('tree');
   tree.innerHTML = '';
   tree.style.display = WIX_ITEMS.length ? 'block' : 'none';
+  if (!WIX_ITEMS.length) return syncGroups();
+  const cols = document.createElement('div'); cols.className = 'cols';
+  cols.innerHTML = '<span title="Download the video file">⬇</span>' +
+    '<span title="Download, then audio, transcribe, translate and subtitles">✨</span>' +
+    '<span class="wide">Download · Process</span>';
+  tree.appendChild(cols);
   // Build nested folders from each item's path.
   const root = { dirs: new Map(), vids: [] };
   WIX_ITEMS.forEach(it => {
@@ -704,19 +769,24 @@ function renderTree() {
     node.vids.push(it);
   });
   const countVids = n => n.vids.length + [...n.dirs.values()].reduce((a, d) => a + countVids(d), 0);
+  function groupBox(det, kind) {
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'grp grp-' + kind;
+    cb.title = kind === 'dl' ? 'Download everything in this folder' : 'Process everything in this folder';
+    cb.onclick = e => {
+      e.stopPropagation();
+      det.querySelectorAll('input.vid-' + kind + ':not(:disabled)').forEach(x => x.checked = cb.checked);
+      syncGroups();
+    };
+    return cb;
+  }
   function build(node, parent, depth) {
     node.dirs.forEach((child, name) => {
       const det = document.createElement('details');
       if (depth < 2) det.open = true;
       const sum = document.createElement('summary');
-      const cb = document.createElement('input');
-      cb.type = 'checkbox'; cb.className = 'grp';
-      cb.onclick = e => {
-        e.stopPropagation();
-        det.querySelectorAll('input.vid-cb:not(:disabled)').forEach(x => x.checked = cb.checked);
-        syncGroups();
-      };
-      sum.appendChild(cb);
+      sum.appendChild(groupBox(det, 'dl'));
+      sum.appendChild(groupBox(det, 'pr'));
       sum.appendChild(document.createTextNode(' 📂 ' + name));
       const n = document.createElement('span'); n.className = 'n';
       n.textContent = '(' + countVids(child) + ')';
@@ -727,12 +797,15 @@ function renderTree() {
     });
     node.vids.forEach(it => {
       const row = document.createElement('label');
-      row.className = 'vid' + (it.downloadable ? '' : ' off');
-      const cb = document.createElement('input');
-      cb.type = 'checkbox'; cb.className = 'vid-cb'; cb.value = it.id;
-      cb.disabled = !it.downloadable; cb.onchange = syncGroups;
-      row.appendChild(cb);
+      row.className = 'vid'; row.dataset.id = it.id;
+      const dl = document.createElement('input');
+      dl.type = 'checkbox'; dl.className = 'vid-dl'; dl.value = it.id; dl.onchange = syncGroups;
+      const pr = document.createElement('input');
+      pr.type = 'checkbox'; pr.className = 'vid-pr'; pr.value = it.id; pr.onchange = syncGroups;
+      row.appendChild(dl); row.appendChild(pr);
       row.appendChild(document.createTextNode('🎬 ' + it.title));
+      const badge = document.createElement('span'); badge.className = 'badge';
+      row.appendChild(badge);
       if (it.note) {
         const note = document.createElement('span'); note.className = 'note';
         note.textContent = '— ' + it.note; row.appendChild(note);
@@ -741,21 +814,61 @@ function renderTree() {
         const btn = document.createElement('button');
         btn.type = 'button'; btn.className = 'small-btn link-btn';
         btn.textContent = LINKS[it.id] ? 'Change link' : 'Paste link';
-        btn.onclick = e => { e.preventDefault(); pasteLink(it, cb, btn); };
+        btn.onclick = e => { e.preventDefault(); pasteLink(it, btn); };
         row.appendChild(btn);
-        if (LINKS[it.id]) { cb.disabled = false; row.classList.remove('off'); }
       }
       const size = document.createElement('span'); size.className = 'size';
       size.textContent = fmtSize(it.size); row.appendChild(size);
       parent.appendChild(row);
+      applyRowState(it, row);
     });
   }
   build(root, tree, 0);
   syncGroups();
 }
 
+// Checkbox and badge state for one row, from what's in the folder right now.
+function applyRowState(it, row) {
+  row = row || document.querySelector('#tree .vid[data-id="' + CSS.escape(it.id) + '"]');
+  if (!row) return;
+  const dl = row.querySelector('.vid-dl'), pr = row.querySelector('.vid-pr');
+  const badge = row.querySelector('.badge');
+  const have = onDisk(it), done = have && it.state.processed;
+  if (have) {
+    dl.checked = true; dl.disabled = true;
+    dl.title = 'Already in the Save to folder';
+  } else {
+    if (dl.disabled && dl.checked) dl.checked = false;  // was on disk, now gone
+    dl.disabled = !canDownload(it);
+    dl.title = dl.disabled ? 'No file link for this video' : 'Download the video file';
+  }
+  pr.disabled = !(canDownload(it) || have);
+  if (pr.disabled) pr.checked = false;
+  pr.title = done ? 'Process again (finished steps are skipped)' : 'Download, then audio, transcribe, translate and subtitles';
+  badge.className = 'badge' + (done ? ' done' : have ? ' dl' : '');
+  badge.textContent = done ? '✓ Subtitled' : have ? '✓ Downloaded' : 'Not downloaded';
+  row.classList.toggle('off', !canDownload(it) && !have);
+}
+
+async function refreshStates() {
+  if (!WIX_ITEMS.length) return;
+  try {
+    const r = await fetch('/api/wix/state', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ output: document.getElementById('output').value })
+    });
+    const j = await r.json();
+    if (!j.ok) return;
+    WIX_ITEMS.forEach(it => { if (j.states[it.id]) it.state = j.states[it.id]; applyRowState(it); });
+    syncGroups();
+  } catch (e) {}
+}
+// Files deleted or added outside the app show up when you come back to it.
+window.addEventListener('focus', () => { if (MODE === 'wix' && !TIMER) refreshStates(); });
+document.getElementById('output').addEventListener('change', refreshStates);
+
 let LINKS = {};
-function pasteLink(it, cb, btn) {
+function pasteLink(it, btn) {
   const link = prompt(
     'Paste a link to "' + it.title + '".\\n\\n' +
     'To find it: open this step on your live site, press F12, go to the Network tab, ' +
@@ -765,33 +878,46 @@ function pasteLink(it, cb, btn) {
   if (link === null) return;
   const v = link.trim();
   if (v && !/^https?:\/\//i.test(v)) return banner('err', 'That is not a web link (it should start with https://).');
-  if (v) { LINKS[it.id] = v; cb.disabled = false; cb.checked = true; }
-  else { delete LINKS[it.id]; cb.checked = false; cb.disabled = true; }
-  cb.closest('.vid').classList.toggle('off', !v);
+  if (v) LINKS[it.id] = v; else delete LINKS[it.id];
   btn.textContent = v ? 'Change link' : 'Paste link';
+  const row = btn.closest('.vid');
+  applyRowState(it, row);
+  if (v && !onDisk(it)) row.querySelector('.vid-dl').checked = true;
   syncGroups();
 }
 
 function syncGroups() {
   document.querySelectorAll('#tree details').forEach(det => {
-    const boxes = [...det.querySelectorAll('input.vid-cb:not(:disabled)')];
-    const on = boxes.filter(b => b.checked).length;
-    const g = det.querySelector(':scope > summary > input.grp');
-    g.checked = boxes.length > 0 && on === boxes.length;
-    g.indeterminate = on > 0 && on < boxes.length;
-    g.disabled = boxes.length === 0;
+    ['dl', 'pr'].forEach(kind => {
+      const boxes = [...det.querySelectorAll('input.vid-' + kind + ':not(:disabled)')];
+      const on = boxes.filter(b => b.checked).length;
+      const g = det.querySelector(':scope > summary > input.grp-' + kind);
+      g.checked = boxes.length > 0 && on === boxes.length;
+      g.indeterminate = on > 0 && on < boxes.length;
+      g.disabled = boxes.length === 0;
+    });
   });
-  const total = WIX_ITEMS.length, picked = selectedIds().length;
-  document.getElementById('wixCount').textContent =
-    total ? picked + ' of ' + total + ' selected' : '';
+  const total = WIX_ITEMS.length;
+  const have = WIX_ITEMS.filter(onDisk).length;
+  const { download_ids, process_ids } = selectedJobs();
+  const parts = [have + ' of ' + total + ' in folder'];
+  if (download_ids.length) parts.push(download_ids.length + ' to download');
+  if (process_ids.length) parts.push(process_ids.length + ' to process');
+  document.getElementById('wixCount').textContent = total ? parts.join(' · ') : '';
 }
 
-function selectedIds() {
-  return [...document.querySelectorAll('#tree input.vid-cb:checked')].map(b => b.value);
+function selectedJobs() {
+  const ids = sel => [...document.querySelectorAll('#tree ' + sel)].map(b => b.value);
+  const process_ids = ids('input.vid-pr:checked');
+  const download_ids = ids('input.vid-dl:checked:not(:disabled)').filter(i => !process_ids.includes(i));
+  return { download_ids, process_ids };
 }
 
-function tickAll(on) {
-  document.querySelectorAll('#tree input.vid-cb:not(:disabled)').forEach(b => b.checked = on);
+function tickAll(kind) {
+  ['dl', 'pr'].forEach(k => {
+    document.querySelectorAll('#tree input.vid-' + k + ':not(:disabled)')
+      .forEach(b => b.checked = (k === kind));
+  });
   syncGroups();
 }
 
@@ -848,9 +974,10 @@ async function start() {
     if (!url) return banner('err', 'Paste a video URL first.');
     body = { mode: 'url', url };
   } else if (MODE === 'wix') {
-    const ids = selectedIds();
-    if (!ids.length) return banner('err', 'Load your videos and tick the ones you want.');
-    body = Object.assign({ mode: 'wix', ids, links: LINKS }, wixCreds());
+    const jobs = selectedJobs();
+    if (!jobs.download_ids.length && !jobs.process_ids.length)
+      return banner('err', 'Load your videos and tick Download or Process on the ones you want.');
+    body = Object.assign({ mode: 'wix', links: LINKS }, jobs, wixCreds());
   } else {
     if (!PICKED || !PICKED.path) return banner('err', 'Choose or drop a video file first.');
     body = { mode: 'file', path: PICKED.path };
@@ -901,6 +1028,10 @@ async function poll() {
   if (!st.running && TIMER) {
     clearInterval(TIMER); TIMER = null;
     document.getElementById('go').disabled = false;
+    if (MODE === 'wix') {
+      if (st.done) document.querySelectorAll('#tree input.vid-pr').forEach(b => b.checked = false);
+      refreshStates();
+    }
     if (st.error) banner('err', st.error);
     else if (st.done) {
       const dir = st.folder ? st.folder : st.result ? st.result.replace(/[\\\\/][^\\\\/]+$/, '') : '';

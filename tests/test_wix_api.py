@@ -180,7 +180,7 @@ def test_handle_wix_list_reports_errors():
 
 def test_handle_start_wix_requires_fresh_listing(monkeypatch):
     A.WIX_ITEMS.clear()
-    ok, msg = A.handle_start({"mode": "wix", "ids": ["media:x"], "api_key": "K",
+    ok, msg = A.handle_start({"mode": "wix", "process_ids": ["media:x"], "api_key": "K",
                               "site_id": SITE})
     assert not ok and "Load videos" in msg
 
@@ -201,13 +201,14 @@ def test_run_wix_batch_mirrors_folders(tmp_path, client, monkeypatch):
         lambda wd, target_lang, model_size, log: wd / f"final_{wd.name}.mp4",
     )
     logs = []
-    result = A.run_wix_batch(client, items, tmp_path, "en", "small", logs.append)
+    jobs = [(it, "process") for it in items]
+    result = A.run_wix_batch(client, jobs, tmp_path, "en", "small", logs.append)
     assert (tmp_path / "Bachata 101" / "01 Week 1" / "01 Welcome" / "video.mp4").exists()
     assert (tmp_path / "Bachata 101" / "02 Week 2" / "01 Footwork" / "video.mp4").exists()
     assert fetched == ["https://orig/m1", "https://orig/m3"]
     assert result["folder"] == str(tmp_path)
     assert "2 of 2" in result["result"]
-    assert any(m.startswith("[item] 1/2") for m in logs)
+    assert any(m.startswith("[item] 1/2 Process:") for m in logs)
 
 
 def test_run_wix_batch_continues_after_a_failure(tmp_path, client, monkeypatch):
@@ -221,7 +222,8 @@ def test_run_wix_batch_continues_after_a_failure(tmp_path, client, monkeypatch):
 
     monkeypatch.setattr(P, "download_file_url", flaky)
     monkeypatch.setattr(P, "run_pipeline", lambda wd, **kw: wd / "final.mp4")
-    result = A.run_wix_batch(client, items, tmp_path, "en", "small", lambda m: None)
+    jobs = [(it, "process") for it in items]
+    result = A.run_wix_batch(client, jobs, tmp_path, "en", "small", lambda m: None)
     assert "1 of 2" in result["result"] and "01 Welcome" in result["result"]
 
 
@@ -307,7 +309,7 @@ def test_pasted_link_is_used_with_ytdlp(client, fake, monkeypatch, tmp_path):
     guest = next(i for i, it in A.WIX_ITEMS.items() if "Guest" in it.title)
     started = {}
     monkeypatch.setattr(A.JM, "start", lambda kind, label, runner: started.update(r=runner) or True)
-    ok, msg = A.handle_start({"mode": "wix", "ids": [guest], "api_key": "KEY",
+    ok, msg = A.handle_start({"mode": "wix", "process_ids": [guest], "api_key": "KEY",
                               "site_id": SITE, "output": str(tmp_path),
                               "links": {guest: " https://site.com/v.m3u8 "}})
     assert ok, msg
@@ -317,3 +319,87 @@ def test_pasted_link_is_used_with_ytdlp(client, fake, monkeypatch, tmp_path):
     monkeypatch.setattr(P, "run_pipeline", lambda wd, **kw: wd / "final.mp4")
     started["r"](lambda m: None)
     assert seen == ["https://site.com/v.m3u8"]
+
+
+# --- disk state and download/process jobs ------------------------------------------
+
+def _listed(fake, monkeypatch, tmp_path, source="programs"):
+    monkeypatch.setattr(W, "_urllib_transport", fake)
+    monkeypatch.setattr(A, "APP_DIR", tmp_path / "app")
+    out = A.handle_wix_list({"api_key": "KEY", "site_id": SITE, "source": source,
+                             "output": str(tmp_path)})
+    return {i["title"]: i for i in out["items"]}
+
+
+def test_state_follows_the_output_folder(fake, monkeypatch, tmp_path):
+    items = _listed(fake, monkeypatch, tmp_path)
+    welcome = items["01 Welcome"]
+    assert welcome["state"] == {"downloaded": False, "processed": False}
+    wd = tmp_path / "Bachata 101" / "01 Week 1" / "01 Welcome"
+    wd.mkdir(parents=True)
+    (wd / "video.mp4").write_bytes(b"v")
+    states = A.handle_wix_state({"output": str(tmp_path)})["states"]
+    assert states[welcome["id"]] == {"downloaded": True, "processed": False}
+    (wd / "final_01 Welcome.mp4").write_bytes(b"f")
+    assert A.handle_wix_state({"output": str(tmp_path)})["states"][welcome["id"]]["processed"]
+    (wd / "video.mp4").unlink()  # deleted outside the app: not downloaded any more
+    assert A.handle_wix_state({"output": str(tmp_path)})["states"][welcome["id"]] == {
+        "downloaded": False, "processed": False}
+
+
+def _start(monkeypatch, tmp_path, **ids):
+    started = {}
+    monkeypatch.setattr(A.JM, "start",
+                        lambda kind, label, runner: started.update(r=runner) or True)
+    ok, msg = A.handle_start(dict({"mode": "wix", "api_key": "KEY", "site_id": SITE,
+                                   "output": str(tmp_path)}, **ids))
+    return ok, msg, started.get("r")
+
+
+def test_download_only_skips_the_pipeline(fake, monkeypatch, tmp_path):
+    items = _listed(fake, monkeypatch, tmp_path)
+    ok, msg, runner = _start(monkeypatch, tmp_path,
+                             download_ids=[items["01 Welcome"]["id"]])
+    assert ok, msg
+    got = []
+    monkeypatch.setattr(P, "download_file_url",
+                        lambda url, wd, log=None, force=False: got.append(wd.name))
+    monkeypatch.setattr(P, "run_pipeline", lambda *a, **k: pytest.fail("processed"))
+    result = runner(lambda m: None)
+    assert got == ["01 Welcome"] and "1 downloaded" in result["result"]
+
+
+def test_process_wins_over_download_and_runs_everything(fake, monkeypatch, tmp_path):
+    items = _listed(fake, monkeypatch, tmp_path)
+    wid, fid = items["01 Welcome"]["id"], items["01 Footwork"]["id"]
+    ok, msg, runner = _start(monkeypatch, tmp_path, download_ids=[wid, fid],
+                             process_ids=[wid])
+    assert ok, msg
+    ran = []
+    monkeypatch.setattr(P, "download_file_url", lambda url, wd, log=None, force=False: None)
+    monkeypatch.setattr(P, "run_pipeline", lambda wd, **k: ran.append(wd.name))
+    result = runner(lambda m: None)
+    assert ran == ["01 Welcome"]
+    assert "1 processed, 1 downloaded" in result["result"]
+
+
+def test_download_of_a_file_already_on_disk_is_skipped(fake, monkeypatch, tmp_path):
+    items = _listed(fake, monkeypatch, tmp_path)
+    wd = tmp_path / "Bachata 101" / "01 Week 1" / "01 Welcome"
+    wd.mkdir(parents=True)
+    (wd / "video.mp4").write_bytes(b"v")
+    ok, msg, _ = _start(monkeypatch, tmp_path, download_ids=[items["01 Welcome"]["id"]])
+    assert not ok and "None of the ticked" in msg
+
+
+def test_video_on_disk_can_be_processed_without_a_wix_link(fake, monkeypatch, tmp_path):
+    items = _listed(fake, monkeypatch, tmp_path)
+    guest = items["03 Guest class"]
+    assert guest["downloadable"] is False
+    wd = tmp_path / "Bachata 101" / "01 Week 1" / "03 Guest class"
+    wd.mkdir(parents=True)
+    (wd / "video.mp4").write_bytes(b"v")
+    ok, msg, runner = _start(monkeypatch, tmp_path, process_ids=[guest["id"]])
+    assert ok, msg
+    monkeypatch.setattr(P, "run_pipeline", lambda wd, **k: None)
+    assert "1 of 1" in runner(lambda m: None)["result"]
