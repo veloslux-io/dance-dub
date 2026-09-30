@@ -141,7 +141,24 @@ def handle_wix_list(payload: dict) -> dict:
         return {"ok": False, "message": f"Could not list videos: {exc}"}
     WIX_ITEMS.clear()
     WIX_ITEMS.update({it.id: it for it in items})
-    return {"ok": True, "source": source, "items": [it.to_dict() for it in items]}
+    out = {"ok": True, "source": source, "items": [it.to_dict() for it in items]}
+    unresolved = {i: s for i, s in getattr(client, "raw_steps", {}).items()
+                  if not WIX_ITEMS[i].downloadable}
+    if unresolved:
+        out["debug_file"] = _save_wix_debug(unresolved)
+    return out
+
+
+def _save_wix_debug(raw_steps: dict) -> str:
+    """Keep what Wix returned for steps with no link (no key or site ID in it),
+    so it can be checked for a link Dance Dub doesn't know about yet."""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        path = APP_DIR / "wix-video-steps.json"
+        path.write_text(json.dumps(raw_steps, indent=2), encoding="utf-8")
+        return str(path)
+    except OSError:
+        return ""
 
 
 def wix_workdir(out_root: Path, item: W.VideoItem) -> Path:
@@ -161,8 +178,13 @@ def run_wix_batch(client: W.WixClient, items: list, out_root: Path,
         workdir = wix_workdir(out_root, item)
         log_fn(f"[item] {i}/{total} {'/'.join(item.path + [item.title])}")
         try:
-            url = "" if P.find_video(workdir) else client.download_url(item)
-            P.download_file_url(url, workdir, log=log_fn)
+            if item.extra.get("needs_ytdlp") and not P.find_video(workdir):
+                # A pasted link or an HLS stream: yt-dlp (with the page-scrape
+                # fallback) handles pages, playlists and plain files alike.
+                P.download_video(item.url, workdir, log=log_fn)
+            else:
+                url = "" if P.find_video(workdir) else client.download_url(item)
+                P.download_file_url(url, workdir, log=log_fn)
             done.append(P.run_pipeline(
                 workdir, target_lang=target, model_size=model, log=log_fn
             ))
@@ -226,6 +248,13 @@ def handle_start(payload: dict) -> tuple[bool, str]:
             return False, "Tick at least one video first."
         if len(items) != len(ids):
             return False, "The video list is out of date. Press Load videos again."
+        for i, link in (payload.get("links") or {}).items():
+            link = (link or "").strip()
+            if i in WIX_ITEMS and link.lower().startswith(("http://", "https://")):
+                it = WIX_ITEMS[i]
+                it.url, it.file_id, it.downloadable = link, "", True
+                it.extra["needs_ytdlp"] = True
+                it.note = "Using the link you pasted"
         items = [it for it in items if it.downloadable]
         if not items:
             return False, "None of the ticked videos can be downloaded."
@@ -464,6 +493,7 @@ INDEX_HTML = """<!doctype html>
   #tree details > .vid { padding-left: 18px; }
   #tree .vid.off { color: var(--muted); }
   #tree .vid .note { color: var(--warn); font-size: 11.5px; }
+  #tree .vid .link-btn { padding: 2px 8px; font-size: 11.5px; border-radius: 7px; }
   #tree .vid .size { color: var(--muted); font-size: 11.5px; margin-left: auto; }
   #tree input[type=checkbox] { accent-color: var(--accent); }
   .now { color: var(--muted); font-size: 12.5px; margin-top: 8px; min-height: 18px; }
@@ -645,7 +675,7 @@ async function loadWix() {
     const j = await r.json();
     if (!j.ok) { WIX_ITEMS = []; banner('err', j.message || 'Could not load videos.'); }
     else {
-      WIX_ITEMS = j.items;
+      WIX_ITEMS = j.items; LINKS = {};
       if (!WIX_ITEMS.length) banner('err', SOURCE === 'media'
         ? 'No videos found in the Media library.' : 'No video steps found in your Online Programs.');
     }
@@ -707,12 +737,38 @@ function renderTree() {
         const note = document.createElement('span'); note.className = 'note';
         note.textContent = '— ' + it.note; row.appendChild(note);
       }
+      if (!it.downloadable && it.extra && it.extra.wix_video_id) {
+        const btn = document.createElement('button');
+        btn.type = 'button'; btn.className = 'small-btn link-btn';
+        btn.textContent = LINKS[it.id] ? 'Change link' : 'Paste link';
+        btn.onclick = e => { e.preventDefault(); pasteLink(it, cb, btn); };
+        row.appendChild(btn);
+        if (LINKS[it.id]) { cb.disabled = false; row.classList.remove('off'); }
+      }
       const size = document.createElement('span'); size.className = 'size';
       size.textContent = fmtSize(it.size); row.appendChild(size);
       parent.appendChild(row);
     });
   }
   build(root, tree, 0);
+  syncGroups();
+}
+
+let LINKS = {};
+function pasteLink(it, cb, btn) {
+  const link = prompt(
+    'Paste a link to "' + it.title + '".\\n\\n' +
+    'To find it: open this step on your live site, press F12, go to the Network tab, ' +
+    'play the video, type "wixstatic" or "m3u8" in the filter box, then right-click the ' +
+    'request and copy its URL. A link to the page the video plays on also works if the page is public.',
+    LINKS[it.id] || '');
+  if (link === null) return;
+  const v = link.trim();
+  if (v && !/^https?:\/\//i.test(v)) return banner('err', 'That is not a web link (it should start with https://).');
+  if (v) { LINKS[it.id] = v; cb.disabled = false; cb.checked = true; }
+  else { delete LINKS[it.id]; cb.checked = false; cb.disabled = true; }
+  cb.closest('.vid').classList.toggle('off', !v);
+  btn.textContent = v ? 'Change link' : 'Paste link';
   syncGroups();
 }
 
@@ -794,7 +850,7 @@ async function start() {
   } else if (MODE === 'wix') {
     const ids = selectedIds();
     if (!ids.length) return banner('err', 'Load your videos and tick the ones you want.');
-    body = Object.assign({ mode: 'wix', ids }, wixCreds());
+    body = Object.assign({ mode: 'wix', ids, links: LINKS }, wixCreds());
   } else {
     if (!PICKED || !PICKED.path) return banner('err', 'Choose or drop a video file first.');
     body = { mode: 'file', path: PICKED.path };
