@@ -63,8 +63,8 @@ run_cli.bat download|extract-audio|transcribe|translate|burn --input output/<vid
 |---|---|
 | `video.mp4` | the original video |
 | `audio.wav` | extracted audio |
-| `transcript.srt` / `transcript.txt` | original-language transcript |
-| `transcript_translated.srt` | translated subtitles |
+| `transcript.srt` / `transcript.vtt` / `transcript.txt` | original-language transcript (`.vtt` is the WebVTT copy web players take as captions) |
+| `transcript_translated.srt` / `transcript_translated.vtt` | translated subtitles |
 | `final_<video name>.mp4` | video with subtitles burned in |
 
 ## Troubleshooting
