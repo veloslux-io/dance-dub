@@ -56,7 +56,8 @@ def cmd_translate(args) -> int:
 
 
 def cmd_burn(args) -> int:
-    P.burn_subtitles(workdir_from(args), log=print)
+    P.burn_subtitles(workdir_from(args), log=print, force=args.force,
+                     quality=args.quality, subs=args.subs)
     return 0
 
 
@@ -69,6 +70,7 @@ def cmd_all(args) -> int:
         source_lang=args.source_lang,
         model_size=args.model,
         log=print,
+        quality=args.quality,
     )
     print(f"\nDone! Subtitled video: {final}")
     return 0
@@ -99,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
             help="Whisper model size (default: small)",
         )
 
+    def add_quality_option(sp):
+        sp.add_argument(
+            "--quality", default="standard", choices=list(P.QUALITIES),
+            help="video quality of the subtitled copy: standard (smaller file) or "
+                 "original (match the source's bitrate). Default: standard",
+        )
+
     p = sub.add_parser("download", help="download a video from a URL")
     add_url_options(p, need_url=True)
     p.set_defaults(func=cmd_download)
@@ -119,12 +128,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("burn", help="burn subtitles into a copy of the video")
     add_url_options(p, need_url=False)
+    add_quality_option(p)
+    p.add_argument("--subs", default="auto", choices=["auto", *P.SUB_TRACKS],
+                   help="which subtitles to burn (default: translated if present)")
+    p.add_argument("--force", action="store_true",
+                   help="make the video again even if it already exists")
     p.set_defaults(func=cmd_burn)
 
     p = sub.add_parser("all", help="run the full pipeline (skips stages already done)")
     add_url_options(p, need_url=True)
     add_lang_options(p)
     add_model_option(p)
+    add_quality_option(p)
     p.set_defaults(func=cmd_all)
 
     return parser

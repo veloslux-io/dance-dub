@@ -9,7 +9,9 @@ Dance Dub takes a video from a Wix site (or any video file on your computer), tr
 3. Double-click **`DanceDub.exe`** — your browser opens the app
    - First launch: Windows SmartScreen may warn ("Windows protected your PC"). Click **More info → Run anyway** — the app is unsigned but only talks to `127.0.0.1` on your own machine
 4. Paste a Wix video page URL, **or** use "From my Wix site" to pick videos from your site (see below), **or** switch to "From a file on this PC" and drop a video in
-5. Pick the language and accuracy, press **Start**
+5. Pick the language, accuracy and video quality, press **Start**
+   - **Video quality → Smaller file** (default) re-encodes at a standard setting, which usually gives a smaller file than the download.
+   - **Same as original** matches the source video's bitrate, so the subtitled copy keeps the original's picture quality and is about the same size.
 
 First transcription downloads the AI model once (~460 MB), then it's cached in your user folder. Output lands in `<user folder>\DanceDub\Videos\<video name>\`.
 
@@ -30,6 +32,17 @@ Lists every video on your own Wix site so you can tick the ones you want and pro
    A folder's boxes tick everything inside it. Press **Start**; one failure doesn't stop the rest.
 
 Output mirrors the listing, e.g. `Videos\Bachata 101\01 Week 1\01 Welcome\final_01 Welcome.mp4`. Program steps that use a video from the separate Wix Video app get no file link from Wix's API. Dance Dub finds those videos in the Media Manager instead, where Wix tags each Wix Video upload with its video ID, and the list shows which file it used. If a step still has no file, press **Paste link** next to it and paste the video's address: open the step on your live site, press F12, go to the Network tab, play the video, filter for `wixstatic` or `m3u8`, and copy that request's URL. When steps stay unresolved, what Wix returned for them is saved to `DanceDub\wix-video-steps.json` (it contains no key). "Remember on this computer" keeps the key in this browser's storage on your PC.
+
+## Edit subtitles and remake the video
+
+Choose **✏️ Edit subtitles** to fix what Whisper heard or how it was translated.
+
+1. Pick a video from the list (every video in the **Save to** folder that has subtitles).
+2. Choose **Original language** or **Translated**. The video plays above the lines and shows your edits as you type. Click a line to jump to it; ▶ plays from it, ＋ adds a line after it, ✕ removes it. Times are `hours:minutes:seconds,milliseconds`.
+3. **Save** writes the `.srt` and `.vtt`. The first save keeps the untouched file as `<name>.srt.bak`.
+4. Choose which subtitles go in the new video and the **Video quality**, then press **Save & remake video**. It replaces `final_<video name>.mp4`.
+
+After fixing the original-language lines, **Translate again** re-translates them into the **Translate to** language. This replaces the translated subtitles, including edits made to them; a backup is kept the first time.
 
 ## macOS / Linux (from source)
 
@@ -55,7 +68,10 @@ Each stage is also a CLI subcommand; finished stages are skipped on re-run, so a
 ```
 run_cli.bat all --url https://your-site.wixsite.com/mysite/page -o output --target-lang en
 run_cli.bat download|extract-audio|transcribe|translate|burn --input output/<video>
+run_cli.bat burn --input output/<video> --quality original --subs original --force
 ```
+
+`--quality original` (on `burn` and `all`) keeps the source's bitrate. `--subs original|translated` picks the subtitles to burn, and `--force` makes the video again.
 
 ## Files produced per video
 
@@ -66,6 +82,8 @@ run_cli.bat download|extract-audio|transcribe|translate|burn --input output/<vid
 | `transcript.srt` / `transcript.vtt` / `transcript.txt` | original-language transcript (`.vtt` is the WebVTT copy web players take as captions) |
 | `transcript_translated.srt` / `transcript_translated.vtt` | translated subtitles |
 | `final_<video name>.mp4` | video with subtitles burned in |
+| `final_settings.json` | the quality and subtitles the final video was made with; changing either remakes it on the next run |
+| `*.srt.bak` | the subtitles as they were before your first edit |
 
 ## Troubleshooting
 

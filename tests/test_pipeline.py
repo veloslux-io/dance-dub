@@ -359,7 +359,7 @@ def test_run_all_order(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         P, "burn_subtitles",
-        lambda wd, style=None, log=None: calls.append("burn")
+        lambda wd, style=None, log=None, quality="standard": calls.append("burn")
         or wd / f"final_{wd.name}.mp4",
     )
 
@@ -405,3 +405,168 @@ def test_translate_writes_vtt(tmp_path):
                          translator_factory=lambda s, t: T())
     vtt = (tmp_path / "transcript_translated.vtt").read_text(encoding="utf-8")
     assert vtt.startswith("WEBVTT") and "Hello" in vtt
+
+
+# --- keep-original-quality burning ------------------------------------------------
+
+def test_video_kbps_from_stream_line():
+    stderr = (
+        "  Duration: 00:01:00.00, start: 0.000000, bitrate: 5130 kb/s\n"
+        "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, "
+        "1920x1080 [SAR 1:1 DAR 16:9], 4997 kb/s, 30 fps, 30 tbr\n"
+        "  Stream #0:1[0x2](und): Audio: aac (LC), 48000 Hz, stereo, fltp, 128 kb/s\n"
+    )
+    assert P.video_kbps_from_probe(stderr) == 4997
+
+
+def test_video_kbps_falls_back_to_container_minus_audio():
+    stderr = (
+        "  Duration: 00:01:00.00, start: 0.000000, bitrate: 3000 kb/s\n"
+        "  Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv), 1280x720, 30 fps\n"
+        "  Stream #0:1: Audio: opus, 48000 Hz, stereo, fltp, 160 kb/s\n"
+    )
+    assert P.video_kbps_from_probe(stderr) == 2840
+    assert P.video_kbps_from_probe("nothing useful") is None
+
+
+def test_video_encode_args():
+    assert P.video_encode_args("standard", 5000) == []
+    args = P.video_encode_args("original", 5000)
+    assert args[args.index("-b:v") + 1] == "5000k"
+    assert args[args.index("-maxrate") + 1] == "7500k"
+    assert "-crf" in P.video_encode_args("original", None)
+
+
+def test_burn_cmd_puts_video_args_before_output():
+    cmd = P.burn_cmd("ffmpeg", Path("v.mp4"), Path("s.ass"), Path("o.mp4"), None,
+                     ["-b:v", "900k"])
+    assert cmd[cmd.index("-b:v") + 1] == "900k"
+    assert cmd[-1] == "o.mp4"
+
+
+def _fake_burn_env(tmp_path, monkeypatch, kbps=1234):
+    (tmp_path / "video.mp4").write_bytes(b"v")
+    (tmp_path / "transcript.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nhola\n",
+                                             encoding="utf-8")
+    (tmp_path / "transcript_translated.srt").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
+    cmds = []
+
+    def fake_run(cmd, log):
+        cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"out")
+
+    monkeypatch.setattr(P, "ffmpeg_exe", lambda: "ffmpeg")
+    monkeypatch.setattr(P, "probe_video_size", lambda f, v: (640, 360))
+    monkeypatch.setattr(P, "probe_video_kbps", lambda f, v: kbps)
+    monkeypatch.setattr(P, "_run_ffmpeg", fake_run)
+    return cmds
+
+
+def test_burn_original_quality_matches_source_bitrate(tmp_path, monkeypatch):
+    cmds = _fake_burn_env(tmp_path, monkeypatch)
+    out = P.burn_subtitles(tmp_path, log=lambda m: None, quality="original")
+    assert out.read_bytes() == b"out"
+    assert cmds[0][cmds[0].index("-b:v") + 1] == "1234k"
+    assert not list(tmp_path.glob("*.part.mp4"))
+
+
+def test_burn_remakes_when_quality_or_subs_change(tmp_path, monkeypatch):
+    cmds = _fake_burn_env(tmp_path, monkeypatch)
+    P.burn_subtitles(tmp_path, log=lambda m: None)
+    P.burn_subtitles(tmp_path, log=lambda m: None)  # same settings: skipped
+    assert len(cmds) == 1 and "-b:v" not in cmds[0]
+    P.burn_subtitles(tmp_path, log=lambda m: None, quality="original")
+    assert len(cmds) == 2
+    P.burn_subtitles(tmp_path, log=lambda m: None, quality="original", subs="original")
+    assert len(cmds) == 3
+    ass = (tmp_path / "subtitles.ass").read_text(encoding="utf-8")
+    assert "hola" in ass and "hello" not in ass
+
+
+def test_burn_old_final_without_settings_counts_as_standard(tmp_path, monkeypatch):
+    cmds = _fake_burn_env(tmp_path, monkeypatch)
+    (tmp_path / f"final_{tmp_path.name}.mp4").write_bytes(b"old")
+    P.burn_subtitles(tmp_path, log=lambda m: None)
+    assert cmds == []
+
+
+def test_burn_failure_keeps_previous_video(tmp_path, monkeypatch):
+    _fake_burn_env(tmp_path, monkeypatch)
+    final = tmp_path / f"final_{tmp_path.name}.mp4"
+    final.write_bytes(b"old")
+
+    def boom(cmd, log):
+        Path(cmd[-1]).write_bytes(b"half")
+        raise RuntimeError("ffmpeg failed")
+
+    monkeypatch.setattr(P, "_run_ffmpeg", boom)
+    with pytest.raises(RuntimeError):
+        P.burn_subtitles(tmp_path, log=lambda m: None, force=True)
+    assert final.read_bytes() == b"old"
+    assert not list(tmp_path.glob("*.part.mp4"))
+
+
+def test_burn_missing_requested_track(tmp_path):
+    (tmp_path / "video.mp4").write_bytes(b"v")
+    (tmp_path / "transcript.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nx\n")
+    with pytest.raises(FileNotFoundError):
+        P.burn_subtitles(tmp_path, log=lambda m: None, subs="translated")
+
+
+# --- subtitle editing -------------------------------------------------------------
+
+def test_parse_timestamp():
+    assert P.parse_timestamp("00:01:02,500") == 62.5
+    assert P.parse_timestamp("1:02.5") == 62.5
+    assert P.parse_timestamp("01:00:00") == 3600
+    for bad in ("abc", "00:61:00,000", "1:2:3:4"):
+        with pytest.raises(ValueError):
+            P.parse_timestamp(bad)
+
+
+def test_save_and_load_cues(tmp_path):
+    srt = tmp_path / "transcript_translated.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
+    P.save_cues(tmp_path, "translated", [
+        {"start": "00:00:05,000", "end": "00:00:06,000", "text": "second  <b>"},
+        {"start": "0:01.5", "end": "0:03", "text": "first\nline"},
+        {"start": "00:00:07,000", "end": "00:00:08,000", "text": "   "},  # dropped
+    ])
+    assert P.load_cues(tmp_path, "translated") == [
+        {"start": "00:00:01,500", "end": "00:00:03,000", "text": "first line"},
+        {"start": "00:00:05,000", "end": "00:00:06,000", "text": "second <b>"},
+    ]
+    assert (tmp_path / "transcript_translated.srt.bak").read_text(encoding="utf-8") \
+        .endswith("hello\n")
+    assert "second &lt;b>" in (tmp_path / "transcript_translated.vtt").read_text(encoding="utf-8")
+    # A second save doesn't replace the untouched backup.
+    P.save_cues(tmp_path, "translated", [{"start": "0:01", "end": "0:02", "text": "x"}])
+    assert "hello" in (tmp_path / "transcript_translated.srt.bak").read_text(encoding="utf-8")
+
+
+def test_save_cues_original_updates_txt(tmp_path):
+    (tmp_path / "transcript.srt").write_text("", encoding="utf-8")
+    P.save_cues(tmp_path, "original", [{"start": "0:00", "end": "0:01", "text": "hola"}])
+    assert (tmp_path / "transcript.txt").read_text(encoding="utf-8") == "hola"
+
+
+def test_save_cues_rejects_bad_times(tmp_path):
+    (tmp_path / "transcript.srt").write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 1"):
+        P.save_cues(tmp_path, "original", [{"start": "0:05", "end": "0:04", "text": "x"}])
+    with pytest.raises(ValueError, match="Line 2"):
+        P.save_cues(tmp_path, "original", [{"start": "0:01", "end": "0:02", "text": "a"},
+                                           {"start": "soon", "end": "0:04", "text": "b"}])
+
+
+def test_find_subtitled_folders(tmp_path):
+    a = tmp_path / "Program" / "01 Step"
+    a.mkdir(parents=True)
+    (a / "video.mp4").write_bytes(b"v")
+    (a / "transcript.srt").write_text("")
+    b = tmp_path / "no-video"
+    b.mkdir()
+    (b / "transcript.srt").write_text("")
+    assert P.find_subtitled_folders(tmp_path) == [a]
+    assert P.find_subtitled_folders(tmp_path / "missing") == []

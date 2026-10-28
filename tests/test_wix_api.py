@@ -198,7 +198,7 @@ def test_run_wix_batch_mirrors_folders(tmp_path, client, monkeypatch):
     monkeypatch.setattr(P, "download_file_url", fake_download)
     monkeypatch.setattr(
         P, "run_pipeline",
-        lambda wd, target_lang, model_size, log: wd / f"final_{wd.name}.mp4",
+        lambda wd, target_lang, model_size, log, quality: wd / f"final_{wd.name}.mp4",
     )
     logs = []
     jobs = [(it, "process") for it in items]

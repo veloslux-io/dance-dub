@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -193,7 +194,7 @@ def wix_workdir(out_root: Path, item: W.VideoItem) -> Path:
 
 
 def run_wix_batch(client: W.WixClient, jobs: list, out_root: Path,
-                  target: str, model: str, log_fn) -> dict:
+                  target: str, model: str, log_fn, quality: str = "standard") -> dict:
     """Work through (item, action) pairs in turn. "download" only fetches the
     video; "process" also runs audio, transcription, translation and
     subtitles. One failure doesn't stop the rest."""
@@ -213,7 +214,7 @@ def run_wix_batch(client: W.WixClient, jobs: list, out_root: Path,
                 P.download_file_url(url, workdir, log=log_fn)
             if action == "process":
                 P.run_pipeline(workdir, target_lang=target, model_size=model,
-                               log=log_fn)
+                               log=log_fn, quality=quality)
             done.append(action)
         except Exception as exc:
             failed.append(item.title)
@@ -239,6 +240,7 @@ def handle_start(payload: dict) -> tuple[bool, str]:
     out_root = _out_root(payload)
     model = payload.get("model") or "small"
     target = payload.get("target_lang") or "en"
+    quality = _quality(payload)
 
     if mode == "url":
         url = (payload.get("url") or "").strip()
@@ -250,7 +252,8 @@ def handle_start(payload: dict) -> tuple[bool, str]:
             workdir.mkdir(parents=True, exist_ok=True)
             P.download_video(url, workdir, log=log_fn)
             return P.run_pipeline(
-                workdir, target_lang=target, model_size=model, log=log_fn
+                workdir, target_lang=target, model_size=model, log=log_fn,
+                quality=quality,
             )
 
         started = JM.start(f"Wix URL — {url}", workdir.name, runner)
@@ -266,7 +269,8 @@ def handle_start(payload: dict) -> tuple[bool, str]:
 
         def runner(log_fn):
             return P.start_from_file(
-                path, out_root, target_lang=target, model_size=model, log=log_fn
+                path, out_root, target_lang=target, model_size=model, log=log_fn,
+                quality=quality,
             )
 
         started = JM.start(f"Local file — {path.name}", path.name, runner)
@@ -305,13 +309,113 @@ def handle_start(payload: dict) -> tuple[bool, str]:
             return False, str(exc)
 
         def runner(log_fn):
-            return run_wix_batch(client, jobs, out_root, target, model, log_fn)
+            return run_wix_batch(client, jobs, out_root, target, model, log_fn,
+                                 quality)
 
         label = f"{len(jobs)} video(s)"
         started = JM.start("Wix site", label, runner)
         return started, "" if started else "A job is already running."
 
     return False, f"Unknown mode: {mode}"
+
+
+def _quality(payload: dict) -> str:
+    q = payload.get("quality")
+    return q if q in P.QUALITIES else "standard"
+
+
+# --- subtitle editor -----------------------------------------------------------
+
+def _subs_folder(payload: dict) -> Path:
+    """The work folder the editor names, if it really is one."""
+    folder = Path(os.path.expanduser(str(payload.get("folder") or "")))
+    if not payload.get("folder") or not (folder / "transcript.srt").is_file():
+        raise ValueError("Pick a video that has subtitles first.")
+    return folder
+
+
+def _subs_track(payload: dict) -> str:
+    track = payload.get("track")
+    if track not in P.SUB_TRACKS:
+        raise ValueError(f"Unknown subtitles: {track}")
+    return track
+
+
+def handle_subs_list(payload: dict) -> dict:
+    """POST /api/subs/list — {output}: videos in the Save to folder with subtitles."""
+    out_root = _out_root(payload)
+    folders = []
+    for wd in P.find_subtitled_folders(out_root):
+        folders.append({
+            "folder": str(wd),
+            "name": wd.relative_to(out_root).as_posix(),
+            "translated": (wd / P.SUB_TRACKS["translated"]).exists(),
+            "final": (wd / f"final_{wd.name}.mp4").exists(),
+        })
+    return {"ok": True, "folders": folders}
+
+
+def handle_subs_load(payload: dict) -> dict:
+    """POST /api/subs/load — {folder, track}: the track's cues."""
+    try:
+        folder, track = _subs_folder(payload), _subs_track(payload)
+        return {"ok": True, "cues": P.load_cues(folder, track)}
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+def handle_subs_save(payload: dict) -> dict:
+    """POST /api/subs/save — {folder, track, cues}: write the edited track."""
+    try:
+        folder, track = _subs_folder(payload), _subs_track(payload)
+        if JM.snapshot()["status"]["running"]:
+            return {"ok": False, "message": "Wait for the running job to finish first."}
+        srt = P.save_cues(folder, track, payload.get("cues") or [])
+        return {"ok": True, "message": f"Saved {srt.name}"}
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+def handle_subs_remake(payload: dict) -> tuple[bool, str]:
+    """POST /api/subs/remake — {folder, subs, quality}: burn the video again."""
+    try:
+        folder = _subs_folder(payload)
+    except ValueError as exc:
+        return False, str(exc)
+    subs = payload.get("subs") if payload.get("subs") in P.SUB_TRACKS else "auto"
+    quality = _quality(payload)
+
+    def runner(log_fn):
+        return P.burn_subtitles(folder, log=log_fn, force=True, quality=quality,
+                                subs=subs)
+
+    started = JM.start("Remake video", folder.name, runner)
+    return started, "" if started else "A job is already running."
+
+
+def handle_subs_retranslate(payload: dict) -> tuple[bool, str]:
+    """POST /api/subs/retranslate — {folder, target_lang}: translate the
+    (edited) original again, replacing the translated track."""
+    try:
+        folder = _subs_folder(payload)
+    except ValueError as exc:
+        return False, str(exc)
+    target = payload.get("target_lang") or "en"
+
+    def runner(log_fn):
+        translated = folder / P.SUB_TRACKS["translated"]
+        backup = translated.with_name(translated.name + ".bak")
+        if translated.exists() and not backup.exists():
+            backup.write_bytes(translated.read_bytes())
+        return P.translate_srt_file(folder / P.SUB_TRACKS["original"],
+                                    target_lang=target, log=log_fn, force=True)
+
+    started = JM.start("Translate again", folder.name, runner)
+    return started, "" if started else "A job is already running."
+
+
+MEDIA_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+               ".mov": "video/quicktime", ".mkv": "video/x-matroska"}
 
 
 def _quit() -> None:
@@ -343,6 +447,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(JM.snapshot())
         elif self.path == "/api/defaults":
             self._json({"output": str(APP_DIR / "Videos"), "version": __version__})
+        elif self.path.startswith("/api/media?"):
+            self._send_media()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -363,6 +469,17 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/start":
             ok, msg = handle_start(payload)
             self._json({"ok": ok, "message": msg})
+        elif self.path == "/api/subs/list":
+            self._json(handle_subs_list(payload))
+        elif self.path == "/api/subs/load":
+            self._json(handle_subs_load(payload))
+        elif self.path == "/api/subs/save":
+            self._json(handle_subs_save(payload))
+        elif self.path in ("/api/subs/remake", "/api/subs/retranslate"):
+            handler = (handle_subs_remake if self.path.endswith("remake")
+                       else handle_subs_retranslate)
+            ok, msg = handler(payload)
+            self._json({"ok": ok, "message": msg})
         elif self.path == "/api/open":
             err = _open_folder(payload.get("path") or "")
             self._json({"ok": not err, "message": err})
@@ -371,6 +488,57 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_quit, daemon=True).start()
         else:
             self._json({"error": "not found"}, 404)
+
+    def _send_media(self) -> None:
+        """Stream a work folder's source video to the editor's player, with
+        Range support so the browser can seek."""
+        from urllib.parse import urlparse, parse_qs
+
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            video = P.find_video(_subs_folder({"folder": (qs.get("folder") or [""])[0]}))
+        except ValueError:
+            video = None
+        if not video:
+            self._json({"error": "not found"}, 404)
+            return
+        size = video.stat().st_size
+        start, end, code = 0, size - 1, 200
+        m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range") or "")
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:  # "bytes=-N": the last N bytes
+                start = max(0, size - int(m.group(2)))
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            code = 206
+        self.send_response(code)
+        self.send_header("Content-Type",
+                         MEDIA_TYPES.get(video.suffix.lower(), "application/octet-stream"))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if code == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        remaining = end - start + 1
+        try:
+            with open(video, "rb") as f:
+                f.seek(start)
+                while remaining > 0:
+                    chunk = f.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the player moved on (seeked or closed); normal
 
     def _handle_upload(self) -> None:
         """Stream an uploaded video to APP_DIR/Uploads (browsers hide real paths)."""
@@ -550,6 +718,25 @@ INDEX_HTML = """<!doctype html>
   #tree .vid .size { color: var(--muted); font-size: 11.5px; margin-left: auto; }
   #tree input[type=checkbox] { accent-color: var(--accent); }
   .now { color: var(--muted); font-size: 12.5px; margin-top: 8px; min-height: 18px; }
+  #edVideo { width: 100%; max-height: 340px; margin-top: 12px; border-radius: 10px;
+    background: #000; display: none; }
+  #cues { position: relative; margin-top: 10px; max-height: 380px; overflow-y: auto;
+    border: 1px solid var(--line); border-radius: 10px; background: #0b0d11; padding: 4px; }
+  #cues:empty { display: none; }
+  .cue { display: flex; align-items: center; gap: 5px; padding: 3px 4px; border-radius: 7px; }
+  .cue.cur { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  .cue .num { width: 30px; color: var(--muted); font-size: 11.5px; text-align: right; flex: none; }
+  .cue input { padding: 5px 7px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--text); font-size: 13px; outline: none; }
+  .cue input.t { width: 104px; flex: none; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .cue input.txt { flex: 1; min-width: 0; }
+  .cue input.bad { border-color: var(--err); }
+  .cue input:focus { border-color: var(--accent); }
+  .cue button { flex: none; padding: 3px 7px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel2); color: var(--muted); cursor: pointer; font-size: 12px; }
+  .cue button:hover { color: var(--text); }
+  .ed-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+  .ed-actions .dirty { color: var(--warn); font-size: 12.5px; margin-left: auto; }
   footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 18px; }
 </style>
 </head>
@@ -571,6 +758,7 @@ INDEX_HTML = """<!doctype html>
       <button id="m-url" class="active" onclick="setMode('url')">🔗&nbsp; From a Wix URL</button>
       <button id="m-wix" onclick="setMode('wix')">🔑&nbsp; From my Wix site</button>
       <button id="m-file" onclick="setMode('file')">📁&nbsp; From a file on this PC</button>
+      <button id="m-edit" onclick="setMode('edit')">✏️&nbsp; Edit subtitles</button>
     </div>
 
     <div id="url-pane">
@@ -619,6 +807,42 @@ INDEX_HTML = """<!doctype html>
       <input type="file" id="fileInput" accept=".mp4,.mov,.mkv,.webm,.m4v" style="display:none">
     </div>
 
+    <div id="edit-pane" style="display:none">
+      <div class="row">
+        <div style="flex:4">
+          <label>Video (from the Save to folder)</label>
+          <select id="edFolder" onchange="edPickFolder()"></select>
+        </div>
+        <div style="flex:none; align-self:flex-end">
+          <button class="small-btn" onclick="edList()" title="Look in the Save to folder again">↻</button>
+        </div>
+      </div>
+      <div class="src">
+        <button id="tr-original" onclick="edTrack('original')">🗣&nbsp; Original language</button>
+        <button id="tr-translated" onclick="edTrack('translated')">🌐&nbsp; Translated</button>
+      </div>
+      <video id="edVideo" controls preload="metadata"></video>
+      <div id="cues"></div>
+      <div class="hint" id="edHint">Click a line to jump to it in the video. Times are hours:minutes:seconds,milliseconds.
+        Your first save keeps the untouched file as a <code>.bak</code> copy.</div>
+      <div class="ed-actions">
+        <button class="small-btn" onclick="edAdd(ED.cues.length - 1)">＋ Add line</button>
+        <button class="small-btn" onclick="edSave()">💾 Save</button>
+        <button class="small-btn" id="edRetr" onclick="edRetranslate()" title="Translate the edited original again, replacing the translated subtitles">🌐 Translate again</button>
+        <span class="dirty" id="edDirty"></span>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <div>
+          <label>Subtitles in the new video</label>
+          <select id="edBurn">
+            <option value="translated">Translated</option>
+            <option value="original">Original language</option>
+          </select>
+        </div>
+        <div></div>
+      </div>
+    </div>
+
     <div class="row" style="margin-top:6px">
       <div>
         <label>Translate to</label>
@@ -642,12 +866,20 @@ INDEX_HTML = """<!doctype html>
         </select>
       </div>
       <div>
+        <label>Video quality</label>
+        <select id="quality" title="How the subtitled copy is compressed">
+          <option value="standard" selected>Smaller file</option>
+          <option value="original">Same as original</option>
+        </select>
+      </div>
+      <div>
         <label>Save to</label>
         <input type="text" id="output" spellcheck="false" placeholder="DanceDub folder (set automatically)">
       </div>
     </div>
 
     <button class="go" id="go" onclick="start()">✨&nbsp; Start</button>
+    <button class="go" id="edGo" onclick="edRemake()" style="display:none">🎬&nbsp; Save &amp; remake video</button>
 
     <div class="now" id="now"></div>
     <div class="stages" style="margin-top:6px">
@@ -682,10 +914,237 @@ init();
 
 function setMode(m) {
   MODE = m;
-  ['url', 'wix', 'file'].forEach(k => {
+  ['url', 'wix', 'file', 'edit'].forEach(k => {
     document.getElementById('m-' + k).classList.toggle('active', m === k);
     document.getElementById(k + '-pane').style.display = m === k ? '' : 'none';
   });
+  // The editor has its own buttons; Start only runs new videos.
+  document.getElementById('go').style.display = m === 'edit' ? 'none' : '';
+  document.getElementById('edGo').style.display = m === 'edit' ? '' : 'none';
+  if (m === 'edit' && !ED.folders) edList();
+}
+
+// --- Subtitle editor ------------------------------------------------------
+const ED = { folders: null, folder: '', track: '', cues: [], dirty: false, url: null };
+
+function post(path, body) {
+  return fetch(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(r => r.json());
+}
+
+// "00:01:02,500" (also "1:02.5") to seconds; NaN when it isn't a time.
+function secs(t) {
+  const p = String(t).trim().replace(',', '.').split(':');
+  if (p.length > 3 || p.some(x => x === '' || isNaN(x))) return NaN;
+  return p.reduce((a, x) => a * 60 + parseFloat(x), 0);
+}
+function stamp(s, sep) {
+  const ms = Math.round(s * 1000), pad = (n, w) => String(n).padStart(w, '0');
+  return pad(Math.floor(ms / 3600000), 2) + ':' + pad(Math.floor(ms / 60000) % 60, 2) + ':' +
+    pad(Math.floor(ms / 1000) % 60, 2) + (sep || ',') + pad(ms % 1000, 3);
+}
+
+function edConfirmLeave() {
+  return !ED.dirty || confirm('You have unsaved subtitle edits. Throw them away?');
+}
+window.addEventListener('beforeunload', e => { if (ED.dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+function edSetDirty(d) {
+  ED.dirty = d;
+  document.getElementById('edDirty').textContent = d ? 'Unsaved changes' : '';
+}
+
+async function edList() {
+  const sel = document.getElementById('edFolder');
+  try {
+    const j = await post('/api/subs/list', { output: document.getElementById('output').value });
+    ED.folders = j.folders || [];
+  } catch (e) { ED.folders = []; }
+  const keep = ED.folder;
+  sel.innerHTML = '';
+  if (!ED.folders.length) {
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = 'No subtitled videos in the Save to folder yet';
+    sel.appendChild(o);
+  }
+  ED.folders.forEach(f => {
+    const o = document.createElement('option');
+    o.value = f.folder;
+    o.textContent = f.name + (f.final ? '  ✓ subtitled' : '');
+    sel.appendChild(o);
+  });
+  if (keep && ED.folders.some(f => f.folder === keep)) { sel.value = keep; edTrackButtons(); }
+  else { ED.folder = ''; edPickFolder(true); }
+}
+
+function edInfo() { return (ED.folders || []).find(f => f.folder === ED.folder); }
+
+function edTrackButtons() {
+  const info = edInfo();
+  const tr = document.getElementById('tr-translated');
+  tr.disabled = !(info && info.translated);
+  tr.title = tr.disabled ? 'This video has no translation yet' : '';
+  ['original', 'translated'].forEach(t =>
+    document.getElementById('tr-' + t).classList.toggle('active', ED.track === t));
+  document.getElementById('edRetr').style.display = ED.track === 'original' ? '' : 'none';
+  document.querySelector('#edBurn option[value=translated]').disabled = tr.disabled;
+}
+
+function edPickFolder(skipConfirm) {
+  const sel = document.getElementById('edFolder');
+  if (!skipConfirm && !edConfirmLeave()) { sel.value = ED.folder; return; }
+  ED.folder = sel.value;
+  const v = document.getElementById('edVideo');
+  v.pause();
+  if (!ED.folder) {
+    v.removeAttribute('src'); v.style.display = 'none';
+    ED.track = ''; ED.cues = []; edSetDirty(false); edRender(); edTrackButtons();
+    return;
+  }
+  v.src = '/api/media?folder=' + encodeURIComponent(ED.folder);
+  v.style.display = 'block';
+  const info = edInfo();
+  ED.track = '';
+  edTrack(info && info.translated ? 'translated' : 'original', true);
+}
+
+async function edTrack(track, skipConfirm) {
+  if (!ED.folder || (track === ED.track && !skipConfirm)) return;
+  if (!skipConfirm && !edConfirmLeave()) return;
+  const j = await post('/api/subs/load', { folder: ED.folder, track });
+  if (!j.ok) return banner('err', j.message || 'Could not open the subtitles.');
+  ED.track = track; ED.cues = j.cues; edSetDirty(false);
+  document.getElementById('edBurn').value = track;
+  edTrackButtons(); edRender();
+}
+
+function edRender() {
+  const box = document.getElementById('cues');
+  box.innerHTML = '';
+  ED.cues.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.className = 'cue'; row.dataset.i = i;
+    const num = document.createElement('span'); num.className = 'num'; num.textContent = i + 1;
+    row.appendChild(num);
+    const field = (key, cls) => {
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.className = cls; inp.value = c[key]; inp.spellcheck = key === 'text';
+      inp.oninput = () => { c[key] = inp.value; edSetDirty(true); edCheck(row, c); edPreview(); };
+      inp.onfocus = () => { const t = secs(c.start); if (!isNaN(t)) edSeek(t, false); };
+      row.appendChild(inp);
+    };
+    field('start', 't'); field('end', 't'); field('text', 'txt');
+    const btn = (label, title, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = label; b.title = title; b.onclick = fn;
+      row.appendChild(b);
+    };
+    btn('▶', 'Play from this line', () => edSeek(secs(c.start), true));
+    btn('＋', 'Add a line after this one', () => edAdd(i));
+    btn('✕', 'Remove this line', () => { ED.cues.splice(i, 1); edSetDirty(true); edRender(); });
+    edCheck(row, c);
+    box.appendChild(row);
+  });
+  edPreview();
+}
+
+function edCheck(row, c) {
+  const s = secs(c.start), e = secs(c.end), [a, b] = row.querySelectorAll('input.t');
+  a.classList.toggle('bad', isNaN(s));
+  b.classList.toggle('bad', isNaN(e) || (!isNaN(s) && e <= s));
+}
+
+function edAdd(i) {
+  if (!ED.folder) return;
+  const prev = ED.cues[i], next = ED.cues[i + 1];
+  const v = document.getElementById('edVideo');
+  const start = prev ? secs(prev.end) : (v.currentTime || 0);
+  let end = start + 2;
+  if (next && !isNaN(secs(next.start))) end = Math.max(start + 0.5, Math.min(end, secs(next.start)));
+  ED.cues.splice(i + 1, 0, { start: stamp(start || 0), end: stamp(end || 2), text: '' });
+  edSetDirty(true); edRender();
+  const row = document.querySelector('#cues .cue[data-i="' + (i + 1) + '"] input.txt');
+  if (row) row.focus();
+}
+
+function edSeek(t, play) {
+  const v = document.getElementById('edVideo');
+  if (isNaN(t) || !v.src) return;
+  v.currentTime = t;
+  if (play) v.play();
+}
+
+// Show the edits on the video as you type, as a WebVTT track.
+let PREVIEW_T = null;
+function edPreview() {
+  clearTimeout(PREVIEW_T);
+  PREVIEW_T = setTimeout(() => {
+    const v = document.getElementById('edVideo');
+    let vtt = 'WEBVTT\\n\\n';
+    ED.cues.forEach(c => {
+      const s = secs(c.start), e = secs(c.end);
+      if (isNaN(s) || isNaN(e) || e <= s || !c.text.trim()) return;
+      vtt += stamp(s, '.') + ' --> ' + stamp(e, '.') + '\\n' +
+        c.text.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;') + '\\n\\n';
+    });
+    v.querySelectorAll('track').forEach(t => t.remove());
+    if (ED.url) URL.revokeObjectURL(ED.url);
+    ED.url = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }));
+    const tr = document.createElement('track');
+    tr.kind = 'subtitles'; tr.label = 'Edited'; tr.src = ED.url; tr.default = true;
+    v.appendChild(tr);
+    tr.track.mode = 'showing';
+  }, 250);
+}
+
+document.getElementById('edVideo').addEventListener('timeupdate', () => {
+  const t = document.getElementById('edVideo').currentTime;
+  const box = document.getElementById('cues');
+  const i = ED.cues.findIndex(c => secs(c.start) <= t && t < secs(c.end));
+  box.querySelectorAll('.cue.cur').forEach(r => { if (+r.dataset.i !== i) r.classList.remove('cur'); });
+  const row = box.querySelector('.cue[data-i="' + i + '"]');
+  if (!row || row.classList.contains('cur')) return;
+  row.classList.add('cur');
+  // Follow along, but not while someone is typing in the list.
+  if (!box.contains(document.activeElement) &&
+      (row.offsetTop < box.scrollTop || row.offsetTop + row.offsetHeight > box.scrollTop + box.clientHeight))
+    box.scrollTop = row.offsetTop - 40;
+});
+
+async function edSave() {
+  if (!ED.folder || !ED.track) { banner('err', 'Pick a video first.'); return false; }
+  const j = await post('/api/subs/save', { folder: ED.folder, track: ED.track, cues: ED.cues });
+  if (!j.ok) { banner('err', j.message || 'Could not save.'); return false; }
+  banner('ok', '✔ ' + j.message);
+  const reload = await post('/api/subs/load', { folder: ED.folder, track: ED.track });
+  if (reload.ok) { ED.cues = reload.cues; edRender(); }
+  edSetDirty(false);
+  return true;
+}
+
+async function edRemake() {
+  if (!ED.folder) return banner('err', 'Pick a video first.');
+  if (ED.dirty && !(await edSave())) return;
+  const j = await post('/api/subs/remake', {
+    folder: ED.folder, subs: document.getElementById('edBurn').value,
+    quality: document.getElementById('quality').value
+  });
+  if (!j.ok) return banner('err', j.message || 'Could not start.');
+  watchJob();
+}
+
+async function edRetranslate() {
+  if (!ED.folder) return banner('err', 'Pick a video first.');
+  if (!confirm('Translate the original-language subtitles again? This replaces the translated subtitles, ' +
+               'including any edits made to them.')) return;
+  if (ED.dirty && !(await edSave())) return;
+  const j = await post('/api/subs/retranslate', {
+    folder: ED.folder, target_lang: document.getElementById('target').value
+  });
+  if (!j.ok) return banner('err', j.message || 'Could not start.');
+  watchJob();
 }
 
 // --- Wix site (API) -------------------------------------------------------
@@ -866,6 +1325,9 @@ async function refreshStates() {
 // Files deleted or added outside the app show up when you come back to it.
 window.addEventListener('focus', () => { if (MODE === 'wix' && !TIMER) refreshStates(); });
 document.getElementById('output').addEventListener('change', refreshStates);
+document.getElementById('output').addEventListener('change', () => {
+  if (MODE === 'edit' && edConfirmLeave()) { edSetDirty(false); ED.folder = ''; edList(); }
+});
 
 let LINKS = {};
 function pasteLink(it, btn) {
@@ -984,6 +1446,7 @@ async function start() {
   }
   body.target_lang = document.getElementById('target').value;
   body.model = document.getElementById('model').value;
+  body.quality = document.getElementById('quality').value;
   body.output = document.getElementById('output').value;
 
   const r = await fetch('/api/start', {
@@ -992,8 +1455,13 @@ async function start() {
   });
   const j = await r.json();
   if (!j.ok) return banner('err', j.message || 'Could not start.');
+  watchJob();
+}
+
+function watchJob() {
   banner('', '');
   document.getElementById('go').disabled = true;
+  document.getElementById('edGo').disabled = true;
   ['download','extract','transcribe','translate','burn'].forEach(resetStage);
   if (TIMER) clearInterval(TIMER);
   poll();
@@ -1028,6 +1496,12 @@ async function poll() {
   if (!st.running && TIMER) {
     clearInterval(TIMER); TIMER = null;
     document.getElementById('go').disabled = false;
+    document.getElementById('edGo').disabled = false;
+    if (MODE === 'edit') {
+      await edList();
+      // A new translation replaces what's shown, unless there are unsaved edits.
+      if (st.done && ED.track === 'translated' && !ED.dirty) edTrack('translated', true);
+    }
     if (MODE === 'wix') {
       if (st.done) document.querySelectorAll('#tree input.vid-pr').forEach(b => b.checked = false);
       refreshStates();

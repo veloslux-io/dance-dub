@@ -8,11 +8,12 @@ re-run to resume after a crash.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 LogFn = Callable[[str], None]
 
@@ -21,6 +22,14 @@ DEFAULT_STYLE = (
     "OutlineColour=&H00000000,BorderStyle=1,Outline=1,Shadow=0,MarginV=30"
 )
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+
+# Video quality for the subtitled copy. "standard" is ffmpeg's default x264
+# setting (CRF 23), which usually comes out smaller than the source;
+# "original" aims for the source's own bitrate so the copy looks the same.
+QUALITIES = ("standard", "original")
+
+# The two subtitle tracks a work folder can hold, by the name the app uses.
+SUB_TRACKS = {"original": "transcript.srt", "translated": "transcript_translated.srt"}
 
 
 def default_log(msg: str) -> None:
@@ -214,6 +223,59 @@ def probe_video_size(ffmpeg: str, video: Path) -> Optional[Tuple[int, int]]:
     return w, h
 
 
+_DURATION_KBPS_RE = re.compile(r"Duration: .*?bitrate: (\d+) kb/s")
+_STREAM_RE = re.compile(r"Stream #.*?: (Video|Audio): (.*)")
+_KBPS_RE = re.compile(r"(\d+) kb/s")
+
+
+def video_kbps_from_probe(stderr: str) -> Optional[int]:
+    """The video stream's bitrate in kb/s from `ffmpeg -i` output.
+
+    MP4s list it on the stream line. MKV/WebM often don't, so fall back to
+    the container's total bitrate minus the audio streams'.
+    """
+    total, audio, video = None, 0, None
+    for line in stderr.splitlines():
+        m = _DURATION_KBPS_RE.search(line)
+        if m:
+            total = int(m.group(1))
+            continue
+        m = _STREAM_RE.search(line)
+        if not m:
+            continue
+        k = _KBPS_RE.search(m.group(2))
+        if m.group(1) == "Video":
+            if video is None and k:
+                video = int(k.group(1))
+        elif k:
+            audio += int(k.group(1))
+    if video:
+        return video
+    if total and total > audio:
+        return total - audio
+    return None
+
+
+def probe_video_kbps(ffmpeg: str, video: Path) -> Optional[int]:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(video)],
+        capture_output=True, text=True, errors="replace", creationflags=flags,
+    )
+    return video_kbps_from_probe(proc.stderr)
+
+
+def video_encode_args(quality: str, source_kbps: Optional[int]) -> List[str]:
+    """ffmpeg video-encoder flags for a quality setting (see QUALITIES)."""
+    if quality != "original":
+        return []
+    if source_kbps:
+        return ["-c:v", "libx264", "-preset", "medium", "-b:v", f"{source_kbps}k",
+                "-maxrate", f"{source_kbps * 3 // 2}k", "-bufsize", f"{source_kbps * 2}k"]
+    # Bitrate unknown: a CRF this low is visually the same as the source.
+    return ["-c:v", "libx264", "-preset", "slow", "-crf", "17"]
+
+
 def _ass_time(h: str, m: str, s: str, ms: str) -> str:
     cs = int(ms.ljust(3, "0")) // 10
     return f"{int(h)}:{m}:{s}.{cs:02d}"
@@ -263,7 +325,8 @@ def srt_to_ass(srt_text: str, width: int, height: int) -> str:
 
 
 def burn_cmd(
-    ffmpeg: str, video: Path, srt: Path, out: Path, style: Optional[str] = DEFAULT_STYLE
+    ffmpeg: str, video: Path, srt: Path, out: Path, style: Optional[str] = DEFAULT_STYLE,
+    video_args: Sequence[str] = (),
 ) -> List[str]:
     vf = f"subtitles='{_escape_filter_path(srt)}'"
     if style:
@@ -275,6 +338,7 @@ def burn_cmd(
         str(video),
         "-vf",
         vf,
+        *video_args,
         "-c:a",
         "copy",
         str(out),
@@ -735,15 +799,16 @@ def translate_srt_file(
 # Stage 5: burn subtitles
 # --------------------------------------------------------------------------
 
-def burn_subtitles(
-    workdir: Path,
-    style: Optional[str] = None,
-    log: LogFn = default_log,
-    force: bool = False,
-) -> Path:
-    video = find_video(workdir)
-    if not video:
-        raise FileNotFoundError("No video in folder — run the download step first.")
+def _burn_source(workdir: Path, subs: str) -> Path:
+    """The SRT to burn: "original", "translated", or "auto" (translated if any)."""
+    if subs in SUB_TRACKS:
+        srt = workdir / SUB_TRACKS[subs]
+        if not srt.exists():
+            raise FileNotFoundError(
+                f"No {subs} subtitles ({srt.name}) in folder — run "
+                + ("translate" if subs == "translated" else "transcribe") + " first."
+            )
+        return srt
     srt = workdir / "transcript_translated.srt"
     if not srt.exists():
         srt = workdir / "transcript.srt"
@@ -751,30 +816,145 @@ def burn_subtitles(
         raise FileNotFoundError(
             "No transcript SRT in folder — run transcribe (and translate) first."
         )
+    return srt
+
+
+def burn_subtitles(
+    workdir: Path,
+    style: Optional[str] = None,
+    log: LogFn = default_log,
+    force: bool = False,
+    quality: str = "standard",
+    subs: str = "auto",
+) -> Path:
+    video = find_video(workdir)
+    if not video:
+        raise FileNotFoundError("No video in folder — run the download step first.")
+    srt = _burn_source(workdir, subs)
     if not srt.read_text(encoding="utf-8").strip():
         raise RuntimeError(
             "No speech was detected in this video, so there are no subtitles "
             "to burn. (Music-only or silent videos can't be captioned.)"
         )
     out = workdir / f"final_{workdir.name}.mp4"
+    # What the existing final video was made with; older ones have no record
+    # and were standard quality.
+    settings_file = workdir / "final_settings.json"
+    settings = {"quality": quality, "subs": srt.name}
     if out.exists() and not force:
-        log(f"[burn] {out.name} exists, skipping")
-        return out
+        try:
+            made = json.loads(settings_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            made = {"quality": "standard", "subs": srt.name}
+        if made == settings:
+            log(f"[burn] {out.name} exists, skipping")
+            return out
+        log(f"[burn] {out.name} was made with other settings, making it again")
     ffmpeg = ffmpeg_exe()
-    subs, burn_style = srt, style or DEFAULT_STYLE
+    burn_file, burn_style = srt, style or DEFAULT_STYLE
     if style is None:
         size = probe_video_size(ffmpeg, video)
         if size:
-            subs = workdir / "subtitles.ass"
-            subs.write_text(
+            burn_file = workdir / "subtitles.ass"
+            burn_file.write_text(
                 srt_to_ass(srt.read_text(encoding="utf-8"), *size), encoding="utf-8"
             )
             burn_style = None
-    cmd = burn_cmd(ffmpeg, video, subs, out, burn_style)
+    video_args: List[str] = []
+    if quality == "original":
+        kbps = probe_video_kbps(ffmpeg, video)
+        video_args = video_encode_args(quality, kbps)
+        log(f"[burn] keeping the original quality ({kbps} kb/s)" if kbps
+            else "[burn] keeping the original quality (near-lossless setting)")
+    # Encode to a side file so a failed or cancelled run keeps the old video.
+    part = workdir / f"final_{workdir.name}.part.mp4"
+    cmd = burn_cmd(ffmpeg, video, burn_file, part, burn_style, video_args)
     log(f"[burn] burning subtitles from {srt.name} (this re-encodes the video)…")
-    _run_ffmpeg(cmd, log)
+    try:
+        _run_ffmpeg(cmd, log)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    part.replace(out)
+    settings_file.write_text(json.dumps(settings), encoding="utf-8")
     log(f"[burn] wrote {out.name}")
     return out
+
+
+# --------------------------------------------------------------------------
+# Subtitle editing
+# --------------------------------------------------------------------------
+
+_EDIT_TIME_RE = re.compile(r"^(?:(\d{1,2}):)?(\d{1,2}):(\d{1,2})(?:[,.](\d{1,3}))?$")
+
+
+def parse_timestamp(text: str) -> float:
+    """Seconds from "H:MM:SS,mmm", also taking "MM:SS" and a "." for the comma."""
+    m = _EDIT_TIME_RE.match(text.strip())
+    if not m:
+        raise ValueError(f"'{text}' is not a time like 00:01:02,500")
+    h, mi, se, ms = m.groups()
+    if int(mi) > 59 or int(se) > 59:
+        raise ValueError(f"'{text}' is not a valid time")
+    return int(h or 0) * 3600 + int(mi) * 60 + int(se) + int((ms or "0").ljust(3, "0")) / 1000
+
+
+def load_cues(workdir: Path, track: str) -> List[Dict[str, str]]:
+    """A subtitle track as [{start, end, text}] for the editor."""
+    srt = workdir / SUB_TRACKS[track]
+    if not srt.exists():
+        raise FileNotFoundError(f"This video has no {track} subtitles yet.")
+    cues = []
+    for _, timespan, text in parse_srt(srt.read_text(encoding="utf-8")):
+        start, end = (t.strip() for t in timespan.split("-->", 1))
+        cues.append({"start": start, "end": end, "text": text})
+    return cues
+
+
+def save_cues(workdir: Path, track: str, cues: Sequence[Dict[str, str]]) -> Path:
+    """Write edited cues back to a track's SRT (and VTT).
+
+    The first save keeps the untouched file as <name>.srt.bak. Cues with no
+    text are dropped, and cues are put in time order.
+    """
+    srt = workdir / SUB_TRACKS[track]
+    timed = []
+    for n, cue in enumerate(cues, start=1):
+        text = " ".join(str(cue.get("text") or "").split())
+        if not text:
+            continue
+        try:
+            start = parse_timestamp(str(cue.get("start") or ""))
+            end = parse_timestamp(str(cue.get("end") or ""))
+        except ValueError as exc:
+            raise ValueError(f"Line {n}: {exc}") from None
+        if end <= start:
+            raise ValueError(f"Line {n}: the end time must be after the start time.")
+        timed.append((start, end, text))
+    timed.sort(key=lambda c: c[0])
+    backup = srt.with_name(srt.name + ".bak")
+    if srt.exists() and not backup.exists():
+        backup.write_bytes(srt.read_bytes())
+    srt.write_text(build_srt(timed), encoding="utf-8")
+    srt.with_suffix(".vtt").write_text(srt_to_vtt(srt.read_text(encoding="utf-8")),
+                                       encoding="utf-8")
+    if track == "original":
+        (workdir / "transcript.txt").write_text(
+            "\n".join(t for _, _, t in timed), encoding="utf-8")
+    return srt
+
+
+def find_subtitled_folders(out_root: Path, limit: int = 500) -> List[Path]:
+    """Work folders under out_root that have a video and a transcript."""
+    found = []
+    if not out_root.is_dir():
+        return found
+    for srt in sorted(out_root.rglob("transcript.srt")):
+        if find_video(srt.parent):
+            found.append(srt.parent)
+            if len(found) >= limit:
+                break
+    return found
 
 
 # --------------------------------------------------------------------------
@@ -789,6 +969,7 @@ def start_from_file(
     model_size: str = "small",
     style: Optional[str] = None,
     log: LogFn = default_log,
+    quality: str = "standard",
 ) -> Path:
     """Run stages 2-5 on a video already on disk. Returns the final video path."""
     video_path = Path(video_path).expanduser().resolve()
@@ -810,7 +991,7 @@ def start_from_file(
         shutil.copy2(video_path, dest)
         log(f"[download] copied {video_path.name} into {workdir.name}")
     return run_pipeline(workdir, target_lang=target_lang, source_lang=source_lang,
-                        model_size=model_size, style=style, log=log)
+                        model_size=model_size, style=style, log=log, quality=quality)
 
 
 def run_pipeline(
@@ -820,6 +1001,7 @@ def run_pipeline(
     model_size: str = "small",
     style: Optional[str] = None,
     log: LogFn = default_log,
+    quality: str = "standard",
 ) -> Path:
     """Run stages 2-5 inside an existing workdir (assumes video present)."""
     extract_audio(workdir, log=log)
@@ -830,7 +1012,7 @@ def run_pipeline(
         source_lang=source_lang,
         log=log,
     )
-    return burn_subtitles(workdir, style=style, log=log)
+    return burn_subtitles(workdir, style=style, log=log, quality=quality)
 
 
 def run_all(
@@ -841,10 +1023,11 @@ def run_all(
     model_size: str = "small",
     style: Optional[str] = None,
     log: LogFn = default_log,
+    quality: str = "standard",
 ) -> Path:
     """Run the full pipeline for one URL. Returns the final video path."""
     workdir = out_root / slugify(url)
     workdir.mkdir(parents=True, exist_ok=True)
     download_video(url, workdir, log=log)
     return run_pipeline(workdir, target_lang=target_lang, source_lang=source_lang,
-                        model_size=model_size, style=style, log=log)
+                        model_size=model_size, style=style, log=log, quality=quality)
